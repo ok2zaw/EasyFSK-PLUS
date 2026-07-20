@@ -1,44 +1,47 @@
 /****************************************************************************
-TinyFSK Version 1.1.0 
-Copyright (C) 2013-2015 Andrew T. Flowers K0SM 
+TinyFSK Version 2.2.0
+Copyright (C) 2013-2015 Andrew T. Flowers K0SM
 
-Permission is hereby granted, free of charge, to any person obtaining a copy 
-of this software and associated documentation files (the "Software"), to deal 
-in the Software without restriction, including without limitation the rights 
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
-copies of the Software, and to permit persons to whom the Software is furnished 
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished
 to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in 
+The above copyright notice and this permission notice shall be included in
 all copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS 
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
 Revisions:
+2.2.0:  ZAW_01: Serial set/get commands (L, T, l, t) for PTT/PA lead and tail
+        timing, persisted to EEPROM.
 2.1.0:  ZAW_01: PTT sequencer
-1.1.0:  Make "Robust UnShift On Space" transmission to be compatible with MMTTY's 
-        non-USOS default receiver.  It is effectively non-USOS transmission 
+1.1.0:  Make "Robust UnShift On Space" transmission to be compatible with MMTTY's
+        non-USOS default receiver.  It is effectively non-USOS transmission
         with extra FIGS shifts if a figs character appears after a space. This should
         always print properly on by USOS and non-USOS demodulators at the expense of
         having to send a few extra symbols in some contest exchages.
 
         Version information displayed at beginning of configuration screen so people
         can tell what version of firmware they have.
-        
+
 1.0.1:  Swap FSK and PTT pins to make pin-compatible with K3NG "nanokeyer"
 1.0.0:  Initial release
 ************************************************************************************/
 
+#include "Arduino.h"
 #include "TimerOne.h"
 #include "EEPROM.h"
 
-#define VERSION "2.1.0 - OK2ZAW mods."
+#define VERSION "2.2.0 - OK2ZAW mods."
 
 //Arduino pins for PTT and FSK to control transmitter
 #define FSK_PIN 11
@@ -49,6 +52,15 @@ Revisions:
 //EEPROM addresses to persist configuration
 #define EE_SPEED_ADDR 0
 #define EE_POLARITY_ADDR 1
+#define EE_PTT_LEAD_ADDR 2     // int (2 bytes): pttLeadMillis
+#define EE_PTT_TAIL_ADDR 4     // int (2 bytes): pttTailMillis
+#define EE_PA_LEAD_ADDR 6      // int (2 bytes): ptt_PA_LeadMillis
+#define EE_PA_TAIL_ADDR 8      // int (2 bytes): ptt_PA_TailMillis
+
+// Sane range for the millisecond timing values above--used to detect
+// blank/uninitialized EEPROM (which reads as -1) and reject garbage.
+#define TIMING_MIN_MS 0
+#define TIMING_MAX_MS 9999
 
 //Special Baudot symbols for shift
 #define LTRS_SHIFT 0x1F  //baudot letter shift byte
@@ -64,15 +76,15 @@ Revisions:
 //BUFFER SETTINGS
 #define SEND_BUFFER_SIZE 500   // Allow up to 500 chars in the buffer
                                // before overrunning (wrapping around).
-                               // This can be increased on most boards 
+                               // This can be increased on most boards
                                // with more RAM.
-                               
+
 #define TX_END_FLAG 0xFF      // Used in Baudot stream to indicate EOT
 
 //References used in banging out the bits for 5-bit baudot. These
 //are relative to the first data bit in the frame.
-#define START_BIT_POS -1  
-#define STOP_BIT_POS 5    
+#define START_BIT_POS -1
+#define STOP_BIT_POS 5
 
 //Commands that control transmitter sequencing
 #define TX_ON '['   // TX now => {TX} in N1MM
@@ -87,6 +99,10 @@ Revisions:
 #define COMMAND_50BAUD '5'
 #define COMMAND_75BAUD '7'
 #define COMMAND_DUMP_CONFIG '?'
+#define COMMAND_SET_PTT_LEAD 'L'  // main relay: time before first start bit
+#define COMMAND_SET_PTT_TAIL 'T'  // main relay: time after last stop bit
+#define COMMAND_SET_PA_LEAD  'l'  // PA/amp stage: time before main relay
+#define COMMAND_SET_PA_TAIL  't'  // PA/amp stage: time after main relay
 
 // Stop bit settings
 #define STOP_BITS_1     1    // 1 stop bit
@@ -94,25 +110,47 @@ Revisions:
 #define STOP_BITS_2     3    // 2 stop bits
 
 // TX USOS settings
-#define USOS_OFF  1       //Assumes that RX will not reset to LTRS shift after space 
+#define USOS_OFF  1       //Assumes that RX will not reset to LTRS shift after space
                           //All shift symbols are explicit and spaces do not change
                           //shift state:
-                          //  K0SM 599 05 NY NY 
+                          //  K0SM 599 05 NY NY
                           //     --> <LTR>K<FIG>0<LTR>SM <FIG>599 05 <LTR>NY NY
-                          
-#define USOS_ON 2         //Space is an implicit LTRS shift character.  "Ham standard" 
+
+#define USOS_ON 2         //Space is an implicit LTRS shift character.  "Ham standard"
                           //demodulators operate in this mode.
-                          //  K0SM 599 05 NY NY 
+                          //  K0SM 599 05 NY NY
                           //     --> <LTR>K<FIG>0<LTR>SM <FIG>599 <FIG>05 NY NY
 
 #define USOS_MMTTY_HACK 3 //Essentially USOS OFF plus extra FIGS shifts for all words
                           //starting with numbers.  This is what MMTTY somewhat misleadingly
                           //calls "USOS transmission."  This settings makes many contest exchanges
-                          //longer (and slightly more prone to bit errors) all to be 
+                          //longer (and slightly more prone to bit errors) all to be
                           //compatible with MMTTY's non-USOS RX default
-                          //  K0SM 599 05 NY NY 
+                          //  K0SM 599 05 NY NY
                           //     --> <LTR>K<FIG>0<LTR>SM <FIG>599 <FIG>05 <LTR>NY NY
 
+
+/******************************************************
+     Function prototypes
+*******************************************************/
+void handleConfigurationCommand(byte b);
+void startNumericEntry(byte cmd);
+void handleNumericEntry(byte b);
+void applyNumericEntry();
+void eeLoad();
+void initTimer();
+void timerISR();
+void displayConfigurationPrompt();
+void displayConfiguration();
+void processHalfBit();
+void resetChar();
+void resetSendBuffer();
+void addToSendBuffer(byte newByte);
+byte getNextSendChar();
+boolean requiresLetters(byte asciiByte);
+boolean requiresFigures(byte asciiByte);
+void setPTT(byte b);
+void echo(byte b);
 
 /******************************************************
      Variable declarations
@@ -125,7 +163,7 @@ Revisions:
 // to a Baudot NULL.  Punctuation will be mapped to '?' if
 // there is no equivalent in the Baudot set.  Note that
 // some punctuation such as '[', ']' and '\' are used
-// to control the PTT behavior.  Tilda (~) is used 
+// to control the PTT behavior.  Tilda (~) is used
 // to enter the configuration menu.  You can use
 // your imagination to add other control functions here.
 int asciiToBaudot[127] = {
@@ -155,7 +193,7 @@ int asciiToBaudot[127] = {
   0,//	Negative Acknowledgement  //	21
   0,//	Synchronous idle	        //	22
   0,//	End of Transmission Block //	23
-  0,//	Cancel	                  //	24  
+  0,//	Cancel	                  //	24
   0,//	End of Medium	            //	25
   0,//	Substitute	              //	26
   0,//	Escape  	                //	27
@@ -195,7 +233,7 @@ int asciiToBaudot[127] = {
   30,//	=	                  //	61 //ITA2
   25,//	>	                  //	62
   25,//	?	                  //	63
-  25,//	@	                  //	64 
+  25,//	@	                  //	64
   3,//	A	                  //	65
   25,//	B	                  //	66
   14,//	C	                  //	67
@@ -255,26 +293,26 @@ int asciiToBaudot[127] = {
   21,//	y	                  //	121
   17,//	z	                  //	122
   15,//	{	                  //	123
-  20,//	|	                  //	124 
+  20,//	|	                  //	124
   18,//	}	                  //	125
   25 //	~ Command escape char     //	126
 };
 
 /*******************************************************
 This section defines static runtime variables that affect
-RTTY transmission.  They are NOT directly changeable by user 
+RTTY transmission.  They are NOT directly changeable by user
 commands because they can get ops into trouble.  They are
 here for the tinkerer/experimenter in case you want access
 to them at runtime.
 ********************************************************/
 
-long serialSpeed = 9600; //This is the speed for the serial 
+long serialSpeed = 9600; //This is the speed for the serial
                          //(more likely USB) connection, 8-N-1
 
 // Not user selectable, but USOS behavior can be changed here.
-// We set this to TX extra shifts to be compatible with silly 
+// We set this to TX extra shifts to be compatible with silly
 // MMTTY default reciever
-int usos = USOS_MMTTY_HACK; 
+int usos = USOS_MMTTY_HACK;
 
 int stopBits =  STOP_BITS_1R5;  // TX 1.5 stop bits
 
@@ -303,9 +341,9 @@ byte lastAsciiByteSent = 0;  // needed to echo back sent characters to terminal
 boolean endWhenBufferEmpty = true;  //flag to kill TX when buffer empty (']')
 
 
-byte currentShiftState = SHIFT_UNKNOWN;  //Keeps track of Letter/Figs state to determine 
+byte currentShiftState = SHIFT_UNKNOWN;  //Keeps track of Letter/Figs state to determine
                                          //if we need to send shift chars
-                                         
+
 boolean ptt = false; // Keeps track of PTT state (true = Transmitter is on)
 
 volatile boolean isrFlag = false;   //set by timer interrupt.  Set high every 1/2 bit
@@ -315,13 +353,22 @@ volatile boolean isrFlag = false;   //set by timer interrupt.  Set high every 1/
 boolean configurationMode = false;  //flag indicates if we are in the menu system or
                                     //in normal operation.
 
+// State for the "set/get timing value" sub-mode of the configuration menu
+// (commands L, T, l, t).  While numericEntryMode is true, incoming serial
+// bytes are digits being accumulated into numericEntryValue rather than
+// being treated as new configuration commands.
+boolean numericEntryMode = false;
+byte numericEntryCommand = 0;      // which command (L/T/l/t) triggered entry
+int numericEntryValue = 0;         // accumulated value so far
+boolean numericEntryHasDigits = false;  // false if user pressed Enter with no digits (a "get")
+
 /*********************************************************************
 Main execution
 ***********************************************************************/
 
 /**
 * Exectutes *once* at program start (when power applied or
-* reset button pressed.  Note that many Arudino devices have a 
+* reset button pressed.  Note that many Arudino devices have a
 * "software reset" option that will reset the processor when
 * the serial port is opened.
 * It opens the port, configures the output pins, and loads
@@ -339,17 +386,17 @@ void setup()
   pinMode(PTT_PA_PIN, OUTPUT); // OK2ZAW
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
   eeLoad();
-  displayConfiguration(); 
+  displayConfiguration();
   // start the half-bit timer.
   initTimer();
-  
+
   Serial.write("\ncmd:\n"); // Tell N1MM we are in "RX" mode.  This will be sent
                             // at the end of transmission.
   digitalWrite(PTT_PIN, LOW);
 }
 
 
-/** 
+/**
 * Main loop.  This loop does two things:
 * (1) Process any input from the serial connection one byte at a time.
 *
@@ -358,27 +405,33 @@ void setup()
 */
 void loop()
 {
-   
+
   // (1) Now read *one* byte from serial port if anything is there.
   // We only read one byte so as not to bog down the processor if
   // hundreds of bytes arrive all at once.  If there is more to read
   // it will be picked up once each time through the loop.
-  if (Serial.available() > 0) 
+  if (Serial.available() > 0)
   {
     // get incoming byte:
     byte b = Serial.read();
-    
+
+    // if we're mid-entry of a numeric timing value (L/T/l/t commands), this
+    // byte is a digit or the Enter key that commits it--handle that first.
+    if (numericEntryMode)
+    {
+      handleNumericEntry(b);
+    }
     // if we are in configuration mode, this byte is likely intended to change
     // a configuration setting.
-    if (configurationMode) 
+    else if (configurationMode)
     {
       handleConfigurationCommand(b);
-    } 
-    else  //not in configuration mode 
+    }
+    else  //not in configuration mode
     {
-      // check for TX abort character.  This immediately kills the 
+      // check for TX abort character.  This immediately kills the
       // transmitter and dumps anything remaining in the buffer.
-      if (b == TX_ABORT) 
+      if (b == TX_ABORT)
       {
         setPTT(false);
         resetSendBuffer();
@@ -390,30 +443,30 @@ void loop()
         // The set PTT method has a delay
         // in it so that there is a chance for another character to
         // arrive in the input buffer.  We return immediately here
-        // so that we can pick it up at the top of this loop.  If we 
-        // didn't do this, we would like continue on, see the buffer 
+        // so that we can pick it up at the top of this loop.  If we
+        // didn't do this, we would like continue on, see the buffer
         //is empty, and transmit a diddle before the first real character.
-        endWhenBufferEmpty = false; 
+        endWhenBufferEmpty = false;
         setPTT(true);
         return; //return to beginning of loop to pick up first char if any
-      } 
+      }
       else if  (b == TX_END)
       {
         endWhenBufferEmpty = true;
       }
-      else if (b == COMMAND_ESCAPE) 
+      else if (b == COMMAND_ESCAPE)
       {
-       configurationMode = true; 
+       configurationMode = true;
        displayConfigurationPrompt();
       }
       else  // character to TX, so add to send buffer
-      { 
+      {
         addToSendBuffer(b);
       }
     }
   }
   // (2) if the ISR fired we need may need to bit-bang something out the the FSK port
-  if (isrFlag) 
+  if (isrFlag)
   {
     processHalfBit();
     isrFlag = false;
@@ -426,81 +479,175 @@ void loop()
 */
 void handleConfigurationCommand(byte b)
 {
-  switch (b) 
+  switch (b)
     {
-      case (COMMAND_POLARITY_MARK_HIGH):  
+      case (COMMAND_POLARITY_MARK_HIGH):
       {
         mark = HIGH;
         space = LOW;
         EEPROM.write(EE_POLARITY_ADDR, b);
         break;
       }
-      case (COMMAND_POLARITY_MARK_LOW):  
+      case (COMMAND_POLARITY_MARK_LOW):
       {
         mark = LOW;
         space = HIGH;
         EEPROM.write(EE_POLARITY_ADDR, b);
         break;
       }
-      case (COMMAND_45BAUD):  
+      case (COMMAND_45BAUD):
       {
         baudrate = 45.45;
         initTimer();
         EEPROM.write(EE_SPEED_ADDR, b);
         break;
-      }   
-      case (COMMAND_50BAUD):   
+      }
+      case (COMMAND_50BAUD):
       {
         baudrate = 50.0;
         initTimer();
         EEPROM.write(EE_SPEED_ADDR, b);
         break;
-      }   
-      case (COMMAND_75BAUD): 
+      }
+      case (COMMAND_75BAUD):
       {
         baudrate = 75.0;
         initTimer();
         EEPROM.write(EE_SPEED_ADDR, b);
         break;
-      }   
-      case (COMMAND_DUMP_CONFIG): 
+      }
+      case (COMMAND_DUMP_CONFIG):
       {
         // we dump it out below
         break;
-      }   
+      }
+      case (COMMAND_SET_PTT_LEAD):
+      case (COMMAND_SET_PTT_TAIL):
+      case (COMMAND_SET_PA_LEAD):
+      case (COMMAND_SET_PA_TAIL):
+      {
+        // These commands need a numeric value typed in next, so hand off
+        // to the numeric entry sub-mode instead of finishing the command here.
+        startNumericEntry(b);
+        return;
+      }
       default :
       {
         Serial.write("\nNot a recognized command. Exiting configuration mode.\n");
-      } 
-    }  
+      }
+    }
     displayConfiguration();
     configurationMode = false;
 }
 
 /**
-* Loads speed and polarity from EEPROM 
-*/ 
+* Begins reading a numeric (millisecond) value for one of the PTT/PA
+* timing commands (L, T, l, t).  Subsequent bytes are handled by
+* handleNumericEntry() until Enter is pressed.
+*/
+void startNumericEntry(byte cmd)
+{
+  numericEntryCommand = cmd;
+  numericEntryValue = 0;
+  numericEntryHasDigits = false;
+  numericEntryMode = true;
+  Serial.print(F("\nEnter new value in ms (0-9999) and press Enter,\nor press Enter alone to view the current value: "));
+}
+
+/**
+* Accumulates digits typed after a set/get timing command.  Enter (CR or LF)
+* commits the value; COMMAND_ESCAPE cancels without changing anything.
+*/
+void handleNumericEntry(byte b)
+{
+  if (b >= '0' && b <= '9')
+  {
+    if (numericEntryValue <= 999)  // cap accumulation at 4 digits (0-9999)
+    {
+      numericEntryValue = numericEntryValue * 10 + (b - '0');
+      numericEntryHasDigits = true;
+      echo(b);  // echo the digit back to the terminal
+    }
+  }
+  else if (b == ASCII_CR || b == ASCII_LF)
+  {
+    applyNumericEntry();
+  }
+  else if (b == COMMAND_ESCAPE)
+  {
+    Serial.print(F("\nCancelled.\n"));
+    numericEntryMode = false;
+    configurationMode = false;
+  }
+  // any other byte is ignored while entering a numeric value
+}
+
+/**
+* Applies (and persists to EEPROM) the value accumulated by
+* handleNumericEntry(), or just re-displays the current configuration if
+* the user pressed Enter without typing any digits (a "get").
+*/
+void applyNumericEntry()
+{
+  if (numericEntryHasDigits)
+  {
+    switch (numericEntryCommand)
+    {
+      case (COMMAND_SET_PTT_LEAD):
+      {
+        pttLeadMillis = numericEntryValue;
+        EEPROM.put(EE_PTT_LEAD_ADDR, pttLeadMillis);
+        break;
+      }
+      case (COMMAND_SET_PTT_TAIL):
+      {
+        pttTailMillis = numericEntryValue;
+        EEPROM.put(EE_PTT_TAIL_ADDR, pttTailMillis);
+        break;
+      }
+      case (COMMAND_SET_PA_LEAD):
+      {
+        ptt_PA_LeadMillis = numericEntryValue;
+        EEPROM.put(EE_PA_LEAD_ADDR, ptt_PA_LeadMillis);
+        break;
+      }
+      case (COMMAND_SET_PA_TAIL):
+      {
+        ptt_PA_TailMillis = numericEntryValue;
+        EEPROM.put(EE_PA_TAIL_ADDR, ptt_PA_TailMillis);
+        break;
+      }
+    }
+  }
+  displayConfiguration();
+  numericEntryMode = false;
+  configurationMode = false;
+}
+
+/**
+* Loads speed, polarity, and PTT/PA timing from EEPROM
+*/
 void eeLoad()
 {
   byte speedChar = EEPROM.read(EE_SPEED_ADDR);
   byte polarity  = EEPROM.read(EE_POLARITY_ADDR);
 
-  if (polarity == COMMAND_POLARITY_MARK_LOW) 
+  if (polarity == COMMAND_POLARITY_MARK_LOW)
   {
-    mark = LOW; 
+    mark = LOW;
   } else {
     mark = HIGH;
   }
   space = !mark;
-  
-  switch (speedChar) 
-  { 
-      case (COMMAND_50BAUD):   
+
+  switch (speedChar)
+  {
+      case (COMMAND_50BAUD):
       {
         baudrate = 50.0;
         break;
-      }   
-      case (COMMAND_75BAUD): 
+      }
+      case (COMMAND_75BAUD):
       {
         baudrate = 75.0;
         break;
@@ -511,25 +658,55 @@ void eeLoad()
         break;
       }
   }
+
+  // Timing values are only overridden if EEPROM holds something sane.
+  // A blank/uninitialized EEPROM reads as 0xFFFF (-1 as a signed int), so
+  // that case (and anything else out of range) falls back to the compiled-in
+  // defaults already assigned to these variables above.
+  int eeValue;
+
+  EEPROM.get(EE_PTT_LEAD_ADDR, eeValue);
+  if (eeValue >= TIMING_MIN_MS && eeValue <= TIMING_MAX_MS)
+  {
+    pttLeadMillis = eeValue;
+  }
+
+  EEPROM.get(EE_PTT_TAIL_ADDR, eeValue);
+  if (eeValue >= TIMING_MIN_MS && eeValue <= TIMING_MAX_MS)
+  {
+    pttTailMillis = eeValue;
+  }
+
+  EEPROM.get(EE_PA_LEAD_ADDR, eeValue);
+  if (eeValue >= TIMING_MIN_MS && eeValue <= TIMING_MAX_MS)
+  {
+    ptt_PA_LeadMillis = eeValue;
+  }
+
+  EEPROM.get(EE_PA_TAIL_ADDR, eeValue);
+  if (eeValue >= TIMING_MIN_MS && eeValue <= TIMING_MAX_MS)
+  {
+    ptt_PA_TailMillis = eeValue;
+  }
 }
 
 /**
-* Init the timer to fire every *half* bit period.  This allows us 
+* Init the timer to fire every *half* bit period.  This allows us
 * to have 1.5 stop bits if we want.
 */
-void initTimer() 
+void initTimer()
 {
-  Timer1.stop(); 
+  Timer1.stop();
   long bitPeriod = (long) ((1.0f/baudrate) * 1000000); //micros
-  Timer1.initialize(bitPeriod/2.0);         
-  Timer1.attachInterrupt(timerISR);    
+  Timer1.initialize(bitPeriod/2.0);
+  Timer1.attachInterrupt(timerISR);
 }
 
 /**
-* The ISR for the half-bit timer is just to set a flag.  We 
+* The ISR for the half-bit timer is just to set a flag.  We
 * will process in the main loop.
 */
-void timerISR() 
+void timerISR()
 {
   isrFlag = true;
 }
@@ -537,22 +714,26 @@ void timerISR()
 /**
 * Displays the configuration options on the console
 */
-void displayConfigurationPrompt() 
+void displayConfigurationPrompt()
 {
-  
+
   Serial.write("\nEnter configuration command.  Valid commands are:\n");
   Serial.write("   0    Set FSK polarity mark = HIGH\n");
   Serial.write("   1    Set FSK polarity mark = LOW\n");
   Serial.write("   4    Set 45.45 baud\n");
   Serial.write("   5    Set 50.0 baud\n");
   Serial.write("   7    Set 75.0 baud\n");
+  Serial.print(F("   L    Set/get PTT lead time, ms (before first bit)\n"));
+  Serial.print(F("   T    Set/get PTT tail time, ms (after last bit)\n"));
+  Serial.print(F("   l    Set/get PA lead time, ms (before PTT)\n"));
+  Serial.print(F("   t    Set/get PA tail time, ms (after PTT)\n"));
   Serial.write("\n   ?    Show current configuration\n");
 }
 
 /**
 * Prints the current configuration the console
 */
-void displayConfiguration() 
+void displayConfiguration()
 {
   Serial.write("\nTinyFSK ");
   Serial.write(VERSION);
@@ -560,16 +741,32 @@ void displayConfiguration()
   Serial.write("   Speed (baud):  ");
   Serial.print(baudrate);
   Serial.write("\n");
-  
+
   Serial.write("   Polarity       ");
-  if (mark == LOW) 
+  if (mark == LOW)
   {
      Serial.write(" mark = logical LOW");
-  } 
-  else 
+  }
+  else
   {
      Serial.write(" mark = logical HIGH");
   }
+  Serial.write("\n");
+
+  Serial.print(F("   PTT lead (ms): "));
+  Serial.print(pttLeadMillis);
+  Serial.write("\n");
+
+  Serial.print(F("   PTT tail (ms): "));
+  Serial.print(pttTailMillis);
+  Serial.write("\n");
+
+  Serial.print(F("   PA lead  (ms): "));
+  Serial.print(ptt_PA_LeadMillis);
+  Serial.write("\n");
+
+  Serial.print(F("   PA tail  (ms): "));
+  Serial.print(ptt_PA_TailMillis);
   Serial.write("\n");
 }
 
@@ -577,7 +774,7 @@ void displayConfiguration()
 * This called every half-bit period to figure out what to bit-bang
 * out the FSK pin.  It is basically an incremental counter that
 * counts half bit periods and toggles the bits of the baudot character
-* as needed.  It bangs out the start bit, five symbol bits, and the 
+* as needed.  It bangs out the start bit, five symbol bits, and the
 * stop bit, which is 1.5 bits long (hence the need to have a timer
 * counting half bits).
 * The 5 bit RTTY character frame looks like this:
@@ -597,45 +794,45 @@ void processHalfBit() {
   {
     return;
   }
-  
-  if (midBit) 
+
+  if (midBit)
   {
    midBit = false; // reset the flag.  Next time we need to send the next bit.
-   return; 
+   return;
   }
-     
+
   // it's time to bang out the next bit.  We check for the special cases
   // first.  If it's a start bit we always sent SPACE and if its a STOP bit
   // we always send MARK.
   if (bitPos == START_BIT_POS) {  // we have to send a start bit
-         
+
     // If it is time to send a start bit, we grab the next character to send so
     // that it is ready the next time through the loop.  The next character
     // might be the TX_END_FLAG, in which case we need to turn off the transmitter.
     sendingChar = getNextSendChar();
-    
+
     if (ptt) {
       if (sendingChar == TX_END_FLAG) //end of data to send
       {
          setPTT(false);
-         return;  
+         return;
       }
-      else 
+      else
       {
         digitalWrite(FSK_PIN, space);  //start bit is always space
         bitPos++;
         midBit = true;
       }
     }
-  } 
+  }
   else if (bitPos == STOP_BIT_POS) // we have to send a stop bit
-  {  
+  {
     //if stopBitCounter == 0 we are at the beginning of a stop bit
     if (stopBitCounter == 0)
     {
       digitalWrite(FSK_PIN, mark);
-      stopBitCounter = stopBits;  //this determines # of half-bit periods we stay in stop bit       
-    } 
+      stopBitCounter = stopBits;  //this determines # of half-bit periods we stay in stop bit
+    }
     else // already in stop bit, just decrement
     {
       // stopBitCounter counts half-bit periods.  2 ==> one stop bit
@@ -651,24 +848,24 @@ void processHalfBit() {
         if (sendingChar == LTRS_SHIFT || (usos == USOS_ON && sendingChar == 0x04) ) //0x04 = Baudot space
         {
           currentShiftState = LTRS_SHIFT;
-        } 
-        else if (sendingChar == FIGS_SHIFT) 
+        }
+        else if (sendingChar == FIGS_SHIFT)
         {
-          currentShiftState = FIGS_SHIFT; 
+          currentShiftState = FIGS_SHIFT;
         }
       }
-    }   
+    }
   }
-  else 
-  { 
-    // We are not sending a stop/start bit, so we send the next bit of the 
+  else
+  {
+    // We are not sending a stop/start bit, so we send the next bit of the
     // of the character.
     bool b = (sendingChar & (0x01 << bitPos));  //LSB first
-    if (b) 
+    if (b)
     {
       digitalWrite(FSK_PIN, mark);
     }
-    else 
+    else
     {
       digitalWrite(FSK_PIN, space);
     }
@@ -678,23 +875,23 @@ void processHalfBit() {
 }
 
 /**
-* Reset character buffer.  This is a helper routine when stop the 
+* Reset character buffer.  This is a helper routine when stop the
 * transmitter so that everything is back to initial states ready
 * to bang out the first character.
 */
-void resetChar() 
+void resetChar()
 {
   sendingChar = LTRS_SHIFT;
-  stopBitCounter = 0;  
-  bitPos = START_BIT_POS;        
-  midBit = false; 
+  stopBitCounter = 0;
+  bitPos = START_BIT_POS;
+  midBit = false;
 }
 
 /**
-*Wipes the send buffer. Helper function for aborting 
+*Wipes the send buffer. Helper function for aborting
 * a transmission.
 */
-void resetSendBuffer() 
+void resetSendBuffer()
 {
   for (int i = 0; i < SEND_BUFFER_SIZE; i++)
   {
@@ -709,7 +906,7 @@ void resetSendBuffer()
 */
 void addToSendBuffer(byte newByte)
 {
-  if (sendBufferBytes < SEND_BUFFER_SIZE) 
+  if (sendBufferBytes < SEND_BUFFER_SIZE)
   {
     sendBufferBytes++;
     sendBufferArray[sendBufferBytes - 1] = newByte;
@@ -725,17 +922,17 @@ byte getNextSendChar()
 {
 
   byte rVal = LTRS_SHIFT;  //default "idle" or "diddles" when nothing to send
-  
+
   if (sendBufferBytes > 0)  // there is still data in buffer to send
   {
     byte asciiByte = sendBufferArray[0];
-    
+
     if (currentShiftState != LTRS_SHIFT && requiresLetters(asciiByte))
     {
       //echo('_');
       return LTRS_SHIFT;
-    } 
-    else if (currentShiftState != FIGS_SHIFT && requiresFigures(asciiByte)) 
+    }
+    else if (currentShiftState != FIGS_SHIFT && requiresFigures(asciiByte))
     {
       //echo('^');
       return FIGS_SHIFT;
@@ -747,13 +944,13 @@ byte getNextSendChar()
     {
       //echo('^');
       return FIGS_SHIFT;
-    }   
+    }
     else //we don't need to send a shift character.  Just find the baudot equiv of the ascii symbol and return it.
     {
       rVal = asciiToBaudot[asciiByte];
       lastAsciiByteSent = asciiByte;
-      sendBufferBytes--; 
-      if (sendBufferBytes > 0) 
+      sendBufferBytes--;
+      if (sendBufferBytes > 0)
       {
         for (int i = 0; i < sendBufferBytes; i++)
         {
@@ -762,20 +959,20 @@ byte getNextSendChar()
       }
       echo(asciiByte);
     }
-  } 
-  else  // the buffer is empty 
-  {  
-    if (endWhenBufferEmpty) 
+  }
+  else  // the buffer is empty
+  {
+    if (endWhenBufferEmpty)
     {
        rVal = TX_END_FLAG;  // signals to stop the TX
-    } 
-    else  // slow typist? 
-    {  
-      if (currentShiftState == SHIFT_UNKNOWN) 
+    }
+    else  // slow typist?
+    {
+      if (currentShiftState == SHIFT_UNKNOWN)
       {
         rVal = LTRS_SHIFT;  //send LTRS idle if we haven't sent anything on this TX
-      } 
-      else 
+      }
+      else
       {
         rVal = currentShiftState; // idle on LTRS or FIGS depending on what state we are in
       }
@@ -789,9 +986,9 @@ byte getNextSendChar()
 * returns whether or not this is a "letter".  Letters require LTRS
 * shift preceding the byte if currently in FIGS mode.
 */
-boolean requiresLetters(byte asciiByte) 
+boolean requiresLetters(byte asciiByte)
 {
-  return (asciiByte >= 'A' && asciiByte <= 'Z') 
+  return (asciiByte >= 'A' && asciiByte <= 'Z')
     || (asciiByte >= 'a' && asciiByte <= 'z');
 
 }
@@ -806,16 +1003,16 @@ boolean requiresFigures(byte asciiByte)
     && (asciiByte != ASCII_NULL) //null
     && (asciiByte != ASCII_LF)   //LF
     && (asciiByte != ASCII_CR)
-    && (asciiByte != ' ');   
+    && (asciiByte != ' ');
 }
 
 
 /**
 * Turns the PTT on or off and applies any delays that might exist.
 */
-void setPTT(byte b) 
+void setPTT(byte b)
 {
-  
+
   if (b)
   {  // PTT ON
     digitalWrite(PTT_PA_PIN, HIGH); // OK2ZAW mod PTT sequencer
@@ -826,12 +1023,12 @@ void setPTT(byte b)
     // before sending the first start bit of the first character
     delay(pttLeadMillis);
   }
-  else 
+  else
   {  // PTT OFF
     digitalWrite(PTT_PA_PIN, LOW); // OK2ZAW mod PTT sequencer
     delay (ptt_PA_TailMillis);
     digitalWrite(PTT_PIN, LOW); // drop PTT
-    digitalWrite(FSK_PIN, space); 
+    digitalWrite(FSK_PIN, space);
     delay (pttTailMillis);
     stopBitCounter = 0;
     bitPos = -1;
@@ -851,7 +1048,3 @@ void echo(byte b)
 {
   Serial.write(b);
 }
-
-
-
-
