@@ -51,6 +51,13 @@ state:
     blank (the string is 8 chars).
 - Line 2: `RX`, `TX`, or `INHIBITED`
 
+Line 1 and line 2 are only ever updated at PTT transitions (key-up/key-down)
+and other non-time-critical moments (e.g. a callsign change) — deliberately
+never from inside `processHalfBit()`/`getNextSendChar()`, since an I2C write
+there would jitter the FSK bit timing. See the note on `getNextSendChar()`
+in [src/TinyFSK_ZAW_01.cpp](src/TinyFSK_ZAW_01.cpp) before adding any new
+LCD content that would need per-character updates during TX.
+
 Requires the `marcoschwartz/LiquidCrystal_I2C` library (declared in
 [platformio.ini](platformio.ini) `lib_deps`, installed automatically by
 `pio run`). Exact wording/layout beyond these fields is still a placeholder

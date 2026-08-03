@@ -1157,6 +1157,13 @@ void addToSendBuffer(byte newByte)
 * Gets the next Baudot (5-bit) char from the buffer.  This
 * function will return LTRS or FIGS shift characters when
 * needed depending on the current shift state and USOS setting.
+*
+* OK2ZAW note: this runs inside processHalfBit(), on the critical path
+* between one half-bit timer tick and the next FSK_PIN transition. Do NOT
+* add LCD/I2C calls (or anything else slow/blocking) here or anywhere else
+* called from processHalfBit()--it directly jitters TX bit timing. LCD
+* updates belong in setPTT() instead, where they land inside the deliberate
+* PA/PTT lead-tail delays, not between bits.
 */
 byte getNextSendChar()
 {
