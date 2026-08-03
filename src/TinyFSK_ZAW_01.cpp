@@ -21,6 +21,27 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
 Revisions:
+2.10.0: ZAW_01: Status LCD layout: callsign now columns 1-6, one blank
+        separator column, PTT source detail now columns 8-16: "TNC " +
+        2-digit baud + "b " + polarity when TNC-sourced (e.g. "TNC 45b H"),
+        "RTS DIGI" when RTS-sourced.
+2.9.0:  ZAW_01: Status LCD line 1, columns 10-16, now shows the current PTT
+        source with detail: when TNC-sourced, "TN" + 2-digit baud rate +
+        "b" + FSK polarity (H/L); when RTS-sourced, "RT" + "DIGI".
+2.8.0:  ZAW_01: Status LCD line 1, columns 10-12, now shows the current PTT
+        source: "TNC" (this board's own serial/Baudot engine) or "RTS"
+        (PTT_USB_RTS_PIN, an external TNC's RTS line).
+2.7.0:  ZAW_01: Added CALLSIGN (serial command C, max 6 chars), persisted to
+        EEPROM. Shown on status LCD line 1, columns 1-6 (falls back to
+        "CALL" when not set). Not used for auto-ID, just stored/displayed.
+2.6.0:  ZAW_01: Added support for an external 16x2 I2C status LCD (PCF8574
+        backpack, address 0x27, on the Nano's hardware I2C pins). Shows
+        RX/TX/INHIBITED state; wording/layout to be refined later.
+2.5.0:  ZAW_01: Added CPU_INH_PIN (Arduino D3 / ATmega328 PD3) hardware
+        inhibit input, internal pull-up, active LOW. Blocks PTT/FSK keying
+        while asserted, force-stops an in-progress TX immediately if
+        asserted mid-transmission, and notifies the PC with an "inh:"
+        status line whenever a TX is blocked or cut short by it.
 2.4.0:  ZAW_01: Added LED_RX_PIN (Arduino D4 / ATmega328 PD4) receive
         indicator LED output, active HIGH, always opposite of PTT_PIN.
 2.3.0:  ZAW_01: Added PTT_USB_RTS_PIN (Arduino D2 / ATmega328 PD2) hardware
@@ -46,8 +67,19 @@ Revisions:
 #include "Arduino.h"
 #include "TimerOne.h"
 #include "EEPROM.h"
+#include "Wire.h"
+#include "LiquidCrystal_I2C.h"
+#include <string.h>
 
-#define VERSION "2.4.0 - OK2ZAW mods."
+#define VERSION "2.10.0 - OK2ZAW mods."
+
+// OK2ZAW mod: external status LCD--16x2 character display on a PCF8574
+// I2C backpack. Wired to the Nano's hardware I2C pins (A4=SDA, A5=SCL).
+#define LCD_I2C_ADDR 0x27
+#define LCD_COLS 16
+#define LCD_ROWS 2
+
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 
 //Arduino pins for PTT and FSK to control transmitter
 #define FSK_PIN 11
@@ -68,6 +100,16 @@ Revisions:
 // Arduino pin D4 = ATmega328 pin 2 (PD4).
 #define LED_RX_PIN 4
 
+// OK2ZAW mod: hardware inhibit input.  While asserted (LOW), the firmware
+// refuses to key PTT_PIN/PTT_PA_PIN and will not clock any data out
+// FSK_PIN--checked before every key-up, and polled continuously so an
+// in-progress TX is force-stopped immediately if this becomes asserted
+// mid-transmission. The PC is told via a distinct "inh:" status line
+// whenever a TX request is blocked or an in-progress TX is cut short by it.
+// Internal pull-up, so a disconnected pin defaults to "not inhibited".
+// Arduino pin D3 = ATmega328 pin 1 (PD3).  Active LOW.
+#define CPU_INH_PIN 3
+
 //EEPROM addresses to persist configuration
 #define EE_SPEED_ADDR 0
 #define EE_POLARITY_ADDR 1
@@ -75,11 +117,17 @@ Revisions:
 #define EE_PTT_TAIL_ADDR 4     // int (2 bytes): pttTailMillis
 #define EE_PA_LEAD_ADDR 6      // int (2 bytes): ptt_PA_LeadMillis
 #define EE_PA_TAIL_ADDR 8      // int (2 bytes): ptt_PA_TailMillis
+#define EE_CALLSIGN_ADDR 10    // null-terminated string, up to CALLSIGN_MAX_LEN chars + NUL
 
 // Sane range for the millisecond timing values above--used to detect
 // blank/uninitialized EEPROM (which reads as -1) and reject garbage.
 #define TIMING_MIN_MS 0
 #define TIMING_MAX_MS 9999
+
+// OK2ZAW mod: operator callsign, settable over serial and persisted to
+// EEPROM. Not used by the TX engine (no auto-ID)--just stored/reported and
+// shown on the status LCD's line 1, columns 1-6 (see lcdShowStatus()).
+#define CALLSIGN_MAX_LEN 6
 
 //Special Baudot symbols for shift
 #define LTRS_SHIFT 0x1F  //baudot letter shift byte
@@ -122,6 +170,7 @@ Revisions:
 #define COMMAND_SET_PTT_TAIL 'T'  // main relay: time after last stop bit
 #define COMMAND_SET_PA_LEAD  'l'  // PA/amp stage: time before main relay
 #define COMMAND_SET_PA_TAIL  't'  // PA/amp stage: time after main relay
+#define COMMAND_SET_CALLSIGN 'C'  // operator callsign
 
 // Stop bit settings
 #define STOP_BITS_1     1    // 1 stop bit
@@ -156,6 +205,9 @@ void handleConfigurationCommand(byte b);
 void startNumericEntry(byte cmd);
 void handleNumericEntry(byte b);
 void applyNumericEntry();
+void startCallsignEntry();
+void handleCallsignEntry(byte b);
+void applyCallsignEntry();
 void eeLoad();
 void initTimer();
 void timerISR();
@@ -169,6 +221,8 @@ byte getNextSendChar();
 boolean requiresLetters(byte asciiByte);
 boolean requiresFigures(byte asciiByte);
 void setPTT(byte b);
+boolean isInhibited();
+void lcdShowStatus(const char* line2);
 void echo(byte b);
 
 /******************************************************
@@ -385,6 +439,22 @@ byte numericEntryCommand = 0;      // which command (L/T/l/t) triggered entry
 int numericEntryValue = 0;         // accumulated value so far
 boolean numericEntryHasDigits = false;  // false if user pressed Enter with no digits (a "get")
 
+// OK2ZAW mod: operator callsign, settable via the C command and persisted
+// to EEPROM. Not used by the TX engine itself--just stored/reported.
+char callsign[CALLSIGN_MAX_LEN + 1] = "";
+
+// State for the "set/get callsign" sub-mode of the configuration menu
+// (command C), mirroring numericEntryMode above but for text.
+boolean callsignEntryMode = false;
+char callsignEntryBuffer[CALLSIGN_MAX_LEN + 1] = "";
+byte callsignEntryLen = 0;
+boolean callsignEntryHasChars = false;  // false if user pressed Enter with no chars (a "get")
+
+// OK2ZAW mod: remembers the last line-2 status text passed to
+// lcdShowStatus(), so other updates (e.g. a callsign change) can redraw
+// line 1 without needing to know the current TX/RX state.
+const char* lcdLastLine2 = "RX";
+
 /*********************************************************************
 Main execution
 ***********************************************************************/
@@ -410,15 +480,21 @@ void setup()
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
   pinMode(PTT_USB_RTS_PIN, INPUT); // OK2ZAW: external pull-up already on the line
   pinMode(LED_RX_PIN, OUTPUT); // OK2ZAW
+  pinMode(CPU_INH_PIN, INPUT_PULLUP); // OK2ZAW
   eeLoad();
   displayConfiguration();
   // start the half-bit timer.
   initTimer();
 
+  Wire.begin(); // OK2ZAW: I2C for the status LCD
+  lcd.init();
+  lcd.backlight();
+
   Serial.write("\ncmd:\n"); // Tell N1MM we are in "RX" mode.  This will be sent
                             // at the end of transmission.
   digitalWrite(PTT_PIN, LOW);
   digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX indicator on--opposite of PTT_PIN
+  lcdShowStatus("RX"); // OK2ZAW
 }
 
 
@@ -432,7 +508,30 @@ void setup()
 void loop()
 {
 
-  // (0) OK2ZAW mod: poll the external hardware PTT-request input.  This lets
+  // (0) OK2ZAW mod: hardware inhibit.  If it becomes asserted while we're
+  // transmitting, force an immediate stop--bypassing the configured PA/PTT
+  // tail delays entirely, since this is a safety cutoff, not a graceful
+  // end of transmission.  A blocked/attempted key-up is instead handled
+  // inside setPTT() itself (see isInhibited()).
+  if (isInhibited() && ptt)
+  {
+    digitalWrite(PTT_PA_PIN, LOW);
+    digitalWrite(PTT_PIN, LOW);
+    digitalWrite(LED_RX_PIN, HIGH);
+    digitalWrite(FSK_PIN, space);
+    ptt = false;
+    rtsKeyed = false;
+    resetSendBuffer();
+    endWhenBufferEmpty = true;
+    resetChar();
+    currentShiftState = SHIFT_UNKNOWN;
+    lastAsciiByteSent = 0;
+    Serial.write("\ninh:\n"); // OK2ZAW: tell the PC the TX was cut by the inhibit input
+    Serial.write("\ncmd:\n"); // Tells N1MM that TX is finished
+    lcdShowStatus("INHIBITED"); // OK2ZAW
+  }
+
+  // (1) OK2ZAW mod: poll the external hardware PTT-request input.  This lets
   // an external/alternate TNC (which does its own FSK/AFSK generation, not
   // routed through this board) key through the same PA/PTT lead-tail
   // sequencer as the [/] serial commands, just via a hardware line instead.
@@ -453,7 +552,7 @@ void loop()
     }
   }
 
-  // (1) Now read *one* byte from serial port if anything is there.
+  // (2) Now read *one* byte from serial port if anything is there.
   // We only read one byte so as not to bog down the processor if
   // hundreds of bytes arrive all at once.  If there is more to read
   // it will be picked up once each time through the loop.
@@ -467,6 +566,11 @@ void loop()
     if (numericEntryMode)
     {
       handleNumericEntry(b);
+    }
+    // similarly, mid-entry of a callsign (C command)--handle that next.
+    else if (callsignEntryMode)
+    {
+      handleCallsignEntry(b);
     }
     // if we are in configuration mode, this byte is likely intended to change
     // a configuration setting.
@@ -512,7 +616,7 @@ void loop()
       }
     }
   }
-  // (2) if the ISR fired we need may need to bit-bang something out the the FSK port
+  // (3) if the ISR fired we need may need to bit-bang something out the the FSK port
   if (isrFlag)
   {
     processHalfBit();
@@ -576,6 +680,13 @@ void handleConfigurationCommand(byte b)
         // These commands need a numeric value typed in next, so hand off
         // to the numeric entry sub-mode instead of finishing the command here.
         startNumericEntry(b);
+        return;
+      }
+      case (COMMAND_SET_CALLSIGN):
+      {
+        // Needs a text value typed in next--hand off to the callsign entry
+        // sub-mode instead of finishing the command here.
+        startCallsignEntry();
         return;
       }
       default :
@@ -672,6 +783,70 @@ void applyNumericEntry()
 }
 
 /**
+* Begins reading a callsign for the C command.  Subsequent bytes are
+* handled by handleCallsignEntry() until Enter is pressed.
+*/
+void startCallsignEntry()
+{
+  callsignEntryLen = 0;
+  callsignEntryBuffer[0] = '\0';
+  callsignEntryHasChars = false;
+  callsignEntryMode = true;
+  Serial.print(F("\nEnter new callsign (max 6 chars) and press Enter,\nor press Enter alone to view the current value: "));
+}
+
+/**
+* Accumulates printable characters typed after the C command (uppercased).
+* Enter (CR or LF) commits the value; COMMAND_ESCAPE cancels without
+* changing anything.
+*/
+void handleCallsignEntry(byte b)
+{
+  if (b == ASCII_CR || b == ASCII_LF)
+  {
+    applyCallsignEntry();
+  }
+  else if (b == COMMAND_ESCAPE)
+  {
+    Serial.print(F("\nCancelled.\n"));
+    callsignEntryMode = false;
+    configurationMode = false;
+  }
+  else if (b >= 0x20 && b <= 0x7E && callsignEntryLen < CALLSIGN_MAX_LEN)  // printable ASCII
+  {
+    if (b >= 'a' && b <= 'z') b -= 32;  // normalize to uppercase
+    callsignEntryBuffer[callsignEntryLen++] = (char) b;
+    callsignEntryBuffer[callsignEntryLen] = '\0';
+    callsignEntryHasChars = true;
+    echo(b);  // echo the character back to the terminal
+  }
+  // any other byte (including overflow past CALLSIGN_MAX_LEN) is ignored
+}
+
+/**
+* Applies (and persists to EEPROM) the callsign accumulated by
+* handleCallsignEntry(), or just re-displays the current configuration if
+* the user pressed Enter without typing any characters (a "get").
+*/
+void applyCallsignEntry()
+{
+  if (callsignEntryHasChars)
+  {
+    byte len = strlen(callsignEntryBuffer);
+    for (byte i = 0; i < len; i++)
+    {
+      EEPROM.write(EE_CALLSIGN_ADDR + i, callsignEntryBuffer[i]);
+    }
+    EEPROM.write(EE_CALLSIGN_ADDR + len, 0);  // terminator--also masks any longer old value
+    strcpy(callsign, callsignEntryBuffer);
+    lcdShowStatus(lcdLastLine2);  // OK2ZAW: refresh line 1 with the new callsign
+  }
+  displayConfiguration();
+  callsignEntryMode = false;
+  configurationMode = false;
+}
+
+/**
 * Loads speed, polarity, and PTT/PA timing from EEPROM
 */
 void eeLoad()
@@ -735,6 +910,19 @@ void eeLoad()
   {
     ptt_PA_TailMillis = eeValue;
   }
+
+  // Callsign is a null-terminated string. Blank/uninitialized EEPROM reads
+  // as 0xFF, and any non-printable byte (including a stored NUL) marks the
+  // end of the string--so this naturally falls back to "" if never set.
+  byte i = 0;
+  while (i < CALLSIGN_MAX_LEN)
+  {
+    byte c = EEPROM.read(EE_CALLSIGN_ADDR + i);
+    if (c < 0x20 || c > 0x7E) break;
+    callsign[i] = (char) c;
+    i++;
+  }
+  callsign[i] = '\0';
 }
 
 /**
@@ -774,6 +962,7 @@ void displayConfigurationPrompt()
   Serial.print(F("   T    Set/get PTT tail time, ms (after last bit)\n"));
   Serial.print(F("   l    Set/get PA lead time, ms (before PTT)\n"));
   Serial.print(F("   t    Set/get PA tail time, ms (after PTT)\n"));
+  Serial.print(F("   C    Set/get callsign (max 6 chars)\n"));
   Serial.write("\n   ?    Show current configuration\n");
 }
 
@@ -814,6 +1003,10 @@ void displayConfiguration()
 
   Serial.print(F("   PA tail  (ms): "));
   Serial.print(ptt_PA_TailMillis);
+  Serial.write("\n");
+
+  Serial.print(F("   Callsign:      "));
+  Serial.write(callsign[0] != '\0' ? callsign : "(not set)");
   Serial.write("\n");
 }
 
@@ -1062,11 +1255,18 @@ void setPTT(byte b)
 
   if (b)
   {  // PTT ON
+    if (isInhibited()) // OK2ZAW: refuse to key up while inhibited
+    {
+      Serial.write("\ninh:\n"); // tell the PC we can't send--inhibited
+      lcdShowStatus("INHIBITED"); // OK2ZAW
+      return;
+    }
     digitalWrite(PTT_PA_PIN, HIGH); // OK2ZAW mod PTT sequencer
     delay(ptt_PA_LeadMillis);
     digitalWrite(FSK_PIN, mark);  //always start in mark state
     digitalWrite(PTT_PIN, HIGH);
     digitalWrite(LED_RX_PIN, LOW); // OK2ZAW: RX LED off--opposite of PTT_PIN
+    lcdShowStatus("TX"); // OK2ZAW
     // we will stay in the mark state for some amount of time
     // before sending the first start bit of the first character
     delay(pttLeadMillis);
@@ -1077,6 +1277,7 @@ void setPTT(byte b)
     delay (ptt_PA_TailMillis);
     digitalWrite(PTT_PIN, LOW); // drop PTT
     digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX LED on--opposite of PTT_PIN
+    lcdShowStatus("RX"); // OK2ZAW
     digitalWrite(FSK_PIN, space);
     delay (pttTailMillis);
     stopBitCounter = 0;
@@ -1087,6 +1288,70 @@ void setPTT(byte b)
     Serial.write("\ncmd:\n"); // Tells N1MM that TX is finished
   }
    ptt = b;
+}
+
+/**
+* OK2ZAW mod: returns true while CPU_INH_PIN is asserted (LOW), meaning
+* keying is disallowed.
+*/
+boolean isInhibited()
+{
+  return digitalRead(CPU_INH_PIN) == LOW;
+}
+
+/**
+* OK2ZAW mod: refreshes the status LCD. Line 1, columns 1-6, show the
+* configured callsign (or "CALL" if none is set); column 7 is a blank
+* separator. Columns 8-16 (9 columns) show the current PTT source:
+*   - TNC (this board's own serial/Baudot engine, the [/]/\ commands):
+*     "TNC " + two-digit baud rate + "b " + polarity ("H" or "L"), e.g.
+*     "TNC 45b H"--fills all 9 columns exactly.
+*   - RTS (PTT_USB_RTS_PIN, an external TNC's RTS line): "RTS DIGI" (8
+*     chars, column 16 left blank)--baud/polarity are this board's own
+*     internal FSK generator settings and don't apply to an external TNC,
+*     so "DIGI" (a generic digital-mode label) is shown instead.
+* Line 2 shows the current state (RX/TX/etc). Remembers the last line2
+* passed in, so other updates (e.g. a callsign change) can redraw line 1
+* without needing to know the current TX/RX state.
+*/
+void lcdShowStatus(const char* line2)
+{
+  lcdLastLine2 = line2;
+
+  const char* callsignField = (callsign[0] != '\0') ? callsign : "CALL";
+
+  char line1[LCD_COLS + 1];
+  byte pos = 0;
+  for (byte i = 0; callsignField[i] != '\0' && pos < 6; i++) line1[pos++] = callsignField[i];
+  while (pos < 7) line1[pos++] = ' ';  // column 7: blank separator
+
+  if (rtsKeyed)
+  {
+    const char* src = "RTS DIGI";  // columns 8-15 (8 chars); column 16 padded blank below
+    for (byte i = 0; src[i] != '\0'; i++) line1[pos++] = src[i];
+  }
+  else
+  {
+    byte baudInt = (byte) baudrate;  // 45, 50, or 75--exactly two digits for all supported rates
+    line1[pos++] = 'T';                          // column 8
+    line1[pos++] = 'N';                          // column 9
+    line1[pos++] = 'C';                          // column 10
+    line1[pos++] = ' ';                           // column 11
+    line1[pos++] = '0' + (baudInt / 10);          // column 12: baud tens digit
+    line1[pos++] = '0' + (baudInt % 10);          // column 13: baud ones digit
+    line1[pos++] = 'b';                           // column 14
+    line1[pos++] = ' ';                           // column 15
+    line1[pos++] = (mark == HIGH) ? 'H' : 'L';    // column 16: FSK polarity
+  }
+  while (pos < LCD_COLS) line1[pos++] = ' ';  // pad any remainder (RTS branch is 1 short)
+  line1[LCD_COLS] = '\0';
+
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+  for (byte i = strlen(line2); i < LCD_COLS; i++) lcd.print(' ');
 }
 
 /**

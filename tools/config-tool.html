@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EasyFSK / TinyFSK Configurator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --border: #d8d8dc;
+    --text: #1c1c1e;
+    --muted: #6b6b70;
+    --accent: #0a66c2;
+    --accent-text: #ffffff;
+    --ok: #1a8a4a;
+    --err: #c4362f;
+    --console-bg: #12141a;
+    --console-text: #d6e2ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c;
+      --panel: #212226;
+      --border: #35363b;
+      --text: #f0f0f2;
+      --muted: #9a9aa0;
+      --accent: #4d9bf0;
+      --accent-text: #0b1220;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin: 0; }
+  .wrap { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 16px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .panel h2 {
+    font-size: 0.95rem;
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .row:last-child { margin-bottom: 0; }
+  .row label { flex: 0 0 110px; font-size: 0.85rem; color: var(--muted); }
+  input[type=number], input[type=text] {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 6px 8px;
+    font-size: 0.9rem;
+    width: 100px;
+  }
+  input[type=text].wide { width: 100%; }
+  button {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary {
+    background: var(--accent);
+    color: var(--accent-text);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--err); display: inline-block;
+  }
+  .status-dot.connected { background: var(--ok); }
+  #status-text { font-size: 0.85rem; color: var(--muted); }
+  #console {
+    background: var(--console-bg);
+    color: var(--console-text);
+    border-radius: 8px;
+    padding: 12px;
+    height: 220px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .radio-group { display: flex; gap: 16px; align-items: center; }
+  .radio-group label { flex: none; display: flex; align-items: center; gap: 4px; color: var(--text); }
+  #unsupported {
+    display: none;
+    background: #4a2020;
+    color: #ffd7d7;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>EasyFSK / TinyFSK Configurator</h1>
+<p class="sub">Sets PTT/PA lead-tail timing and other config over the board's USB-serial link (9600 baud, 8-N-1). Requires Chrome, Edge, or Opera.</p>
+
+<div class="wrap">
+
+  <div id="unsupported">
+    Your browser doesn't support the Web Serial API. Open this file in a
+    recent desktop version of Chrome, Edge, or Opera.
+  </div>
+
+  <div class="panel">
+    <h2><span id="status-dot" class="status-dot"></span> Connection</h2>
+    <div class="row">
+      <button id="btn-connect" class="primary">Connect</button>
+      <button id="btn-disconnect" disabled>Disconnect</button>
+      <span id="status-text">Not connected</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>PTT / PA Timing (ms)</h2>
+    <div class="row">
+      <label>PTT lead (L)</label>
+      <input type="number" id="val-L" min="0" max="9999" placeholder="0-9999">
+      <button data-set="L" data-val="val-L" disabled>Set</button>
+      <button data-get="L" disabled>Get</button>
+    </div>
+    <div class="row">
+      <label>PTT tail (T)</label>
+      <input type="number" id="val-T" min="0" max="9999" placeholder="0-9999">
+      <button data-set="T" data-val="val-T" disabled>Set</button>
+      <button data-get="T" disabled>Get</button>
+    </div>
+    <div class="row">
+      <label>PA lead (l)</label>
+      <input type="number" id="val-l" min="0" max="9999" placeholder="0-9999">
+      <button data-set="l" data-val="val-l" disabled>Set</button>
+      <button data-get="l" disabled>Get</button>
+    </div>
+    <div class="row">
+      <label>PA tail (t)</label>
+      <input type="number" id="val-t" min="0" max="9999" placeholder="0-9999">
+      <button data-set="t" data-val="val-t" disabled>Set</button>
+      <button data-get="t" disabled>Get</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Callsign</h2>
+    <div class="row">
+      <label>Callsign</label>
+      <input type="text" id="val-C" maxlength="6" placeholder="max 6 chars" style="text-transform:uppercase">
+      <button data-set="C" data-val="val-C" disabled>Set</button>
+      <button data-get="C" disabled>Get</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Speed &amp; Polarity</h2>
+    <div class="row">
+      <label>RTTY speed</label>
+      <button data-plain="4" disabled>45.45 baud</button>
+      <button data-plain="5" disabled>50.0 baud</button>
+      <button data-plain="7" disabled>75.0 baud</button>
+    </div>
+    <div class="row">
+      <label>FSK polarity</label>
+      <button data-plain="0" disabled>Mark = HIGH</button>
+      <button data-plain="1" disabled>Mark = LOW</button>
+    </div>
+    <div class="row">
+      <label>&nbsp;</label>
+      <button data-plain="?" disabled>Show current configuration</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Advanced / raw command</h2>
+    <div class="row">
+      <input type="text" id="raw-cmd" class="wide" placeholder="e.g. ~L200 (sent as typed, no auto Enter)">
+    </div>
+    <div class="row">
+      <button id="btn-raw-send" disabled>Send</button>
+      <button id="btn-raw-send-cr" disabled>Send + Enter</button>
+      <span class="sub">For commands added in later firmware versions.</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Console</h2>
+    <div id="console"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn-clear">Clear</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  const supported = 'serial' in navigator;
+  if (!supported) {
+    document.getElementById('unsupported').style.display = 'block';
+  }
+
+  // Commands that need a trailing Enter (CR) to commit a typed value
+  // (numeric timing values, or the callsign string). Everything else
+  // (baud, polarity, dump-config) executes on the single command byte with
+  // no Enter -- sending a stray CR/LF after those would get queued as a
+  // character to transmit by the firmware, so we never do that.
+  const NUMERIC_CMDS = new Set(['L', 'T', 'l', 't', 'C']);
+
+  let port = null;
+  let writer = null;
+  let writableStreamClosed = null;
+  let reader = null;
+  let readableStreamClosed = null;
+
+  const dot = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+  const consoleEl = document.getElementById('console');
+  const btnConnect = document.getElementById('btn-connect');
+  const btnDisconnect = document.getElementById('btn-disconnect');
+
+  function log(text) {
+    consoleEl.textContent += text;
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  function setConnectedUI(connected) {
+    dot.classList.toggle('connected', connected);
+    statusText.textContent = connected ? 'Connected' : 'Not connected';
+    btnConnect.disabled = connected;
+    btnDisconnect.disabled = !connected;
+    document.querySelectorAll('button[data-set], button[data-get], button[data-plain], #btn-raw-send, #btn-raw-send-cr')
+      .forEach(b => { b.disabled = !connected; });
+  }
+
+  async function connect() {
+    try {
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' });
+
+      const textEncoder = new TextEncoderStream();
+      writableStreamClosed = textEncoder.readable.pipeTo(port.writable);
+      writer = textEncoder.writable.getWriter();
+
+      const textDecoder = new TextDecoderStream();
+      readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+      reader = textDecoder.readable.getReader();
+
+      setConnectedUI(true);
+      log('[connected]\n');
+      readLoop();
+    } catch (err) {
+      log('[connect failed: ' + err.message + ']\n');
+    }
+  }
+
+  async function readLoop() {
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) log(value);
+      }
+    } catch (err) {
+      log('\n[read error: ' + err.message + ']\n');
+    }
+  }
+
+  async function disconnect() {
+    try {
+      if (reader) {
+        await reader.cancel().catch(() => {});
+        await readableStreamClosed.catch(() => {});
+        reader = null;
+      }
+      if (writer) {
+        await writer.close().catch(() => {});
+        await writableStreamClosed.catch(() => {});
+        writer = null;
+      }
+      if (port) {
+        await port.close();
+        port = null;
+      }
+    } finally {
+      setConnectedUI(false);
+      log('[disconnected]\n');
+    }
+  }
+
+  async function send(text) {
+    if (!writer) return;
+    try {
+      await writer.write(text);
+    } catch (err) {
+      log('\n[send error: ' + err.message + ']\n');
+    }
+  }
+
+  // Builds and sends "~<cmd>[value]\r" for numeric commands (Enter commits,
+  // or commits a "get" if value is empty) and "~<cmd>" for plain commands.
+  function sendConfigCommand(cmd, value) {
+    let payload = '~' + cmd;
+    if (NUMERIC_CMDS.has(cmd)) {
+      if (value !== undefined && value !== '') payload += value;
+      payload += '\r';
+    }
+    send(payload);
+  }
+
+  btnConnect.addEventListener('click', connect);
+  btnDisconnect.addEventListener('click', disconnect);
+  document.getElementById('btn-clear').addEventListener('click', () => { consoleEl.textContent = ''; });
+
+  document.querySelectorAll('button[data-set]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const cmd = btn.dataset.set;
+      const value = document.getElementById(btn.dataset.val).value;
+      sendConfigCommand(cmd, value);
+    });
+  });
+
+  document.querySelectorAll('button[data-get]').forEach(btn => {
+    btn.addEventListener('click', () => sendConfigCommand(btn.dataset.get));
+  });
+
+  document.querySelectorAll('button[data-plain]').forEach(btn => {
+    btn.addEventListener('click', () => send('~' + btn.dataset.plain));
+  });
+
+  document.getElementById('btn-raw-send').addEventListener('click', () => {
+    send(document.getElementById('raw-cmd').value);
+  });
+  document.getElementById('btn-raw-send-cr').addEventListener('click', () => {
+    send(document.getElementById('raw-cmd').value + '\r');
+  });
+
+  setConnectedUI(false);
+})();
+</script>
+
+</body>
+</html>
