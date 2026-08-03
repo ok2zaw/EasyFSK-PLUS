@@ -21,6 +21,12 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
 Revisions:
+2.4.0:  ZAW_01: Added LED_RX_PIN (Arduino D4 / ATmega328 PD4) receive
+        indicator LED output, active HIGH, always opposite of PTT_PIN.
+2.3.0:  ZAW_01: Added PTT_USB_RTS_PIN (Arduino D2 / ATmega328 PD2) hardware
+        PTT-request input, external pull-up, active LOW. Lets an external/
+        alternate TNC key through the PA/PTT lead-tail sequencer without
+        going through this board's serial port or internal FSK generator.
 2.2.0:  ZAW_01: Serial set/get commands (L, T, l, t) for PTT/PA lead and tail
         timing, persisted to EEPROM.
 2.1.0:  ZAW_01: PTT sequencer
@@ -41,13 +47,26 @@ Revisions:
 #include "TimerOne.h"
 #include "EEPROM.h"
 
-#define VERSION "2.2.0 - OK2ZAW mods."
+#define VERSION "2.4.0 - OK2ZAW mods."
 
 //Arduino pins for PTT and FSK to control transmitter
 #define FSK_PIN 11
 #define PTT_PIN 13
 #define PTT_PA_PIN 10
 #define ON_PIN 8
+
+// OK2ZAW mod: hardware PTT-request input, e.g. from the RTS line of an
+// external/alternate TNC's USB-serial adapter.  Lets that external TNC key
+// through this board's PA/PTT lead-tail sequencer without going through
+// this board's own serial port or internal FSK/Baudot generator.
+// Arduino pin D2 = ATmega328 pin 32 (PD2).  External pull-up on the line;
+// active LOW (asserted/PTT-requested = LOW).
+#define PTT_USB_RTS_PIN 2
+
+// OK2ZAW mod: receive indicator LED.  Active HIGH; always the opposite
+// state of PTT_PIN (lit while receiving, off while transmitting).
+// Arduino pin D4 = ATmega328 pin 2 (PD4).
+#define LED_RX_PIN 4
 
 //EEPROM addresses to persist configuration
 #define EE_SPEED_ADDR 0
@@ -346,6 +365,10 @@ byte currentShiftState = SHIFT_UNKNOWN;  //Keeps track of Letter/Figs state to d
 
 boolean ptt = false; // Keeps track of PTT state (true = Transmitter is on)
 
+// OK2ZAW mod: true while the current TX was started by PTT_USB_RTS_PIN
+// (rather than by the [/] serial commands), so we know it's ours to release.
+boolean rtsKeyed = false;
+
 volatile boolean isrFlag = false;   //set by timer interrupt.  Set high every 1/2 bit
                                     //to indicate when we should exectute the bit-banging
                                     //routine.  This is handled in the main loop function.
@@ -385,6 +408,8 @@ void setup()
   pinMode(PTT_PIN, OUTPUT);
   pinMode(PTT_PA_PIN, OUTPUT); // OK2ZAW
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
+  pinMode(PTT_USB_RTS_PIN, INPUT); // OK2ZAW: external pull-up already on the line
+  pinMode(LED_RX_PIN, OUTPUT); // OK2ZAW
   eeLoad();
   displayConfiguration();
   // start the half-bit timer.
@@ -393,6 +418,7 @@ void setup()
   Serial.write("\ncmd:\n"); // Tell N1MM we are in "RX" mode.  This will be sent
                             // at the end of transmission.
   digitalWrite(PTT_PIN, LOW);
+  digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX indicator on--opposite of PTT_PIN
 }
 
 
@@ -405,6 +431,27 @@ void setup()
 */
 void loop()
 {
+
+  // (0) OK2ZAW mod: poll the external hardware PTT-request input.  This lets
+  // an external/alternate TNC (which does its own FSK/AFSK generation, not
+  // routed through this board) key through the same PA/PTT lead-tail
+  // sequencer as the [/] serial commands, just via a hardware line instead.
+  // Active LOW.  Skipped while in the configuration menu.
+  if (!configurationMode && !numericEntryMode)
+  {
+    boolean rtsAsserted = (digitalRead(PTT_USB_RTS_PIN) == LOW);
+    if (rtsAsserted && !ptt)
+    {
+      rtsKeyed = true;
+      endWhenBufferEmpty = false;
+      setPTT(true);
+    }
+    else if (!rtsAsserted && rtsKeyed)
+    {
+      rtsKeyed = false;
+      endWhenBufferEmpty = true;
+    }
+  }
 
   // (1) Now read *one* byte from serial port if anything is there.
   // We only read one byte so as not to bog down the processor if
@@ -1019,6 +1066,7 @@ void setPTT(byte b)
     delay(ptt_PA_LeadMillis);
     digitalWrite(FSK_PIN, mark);  //always start in mark state
     digitalWrite(PTT_PIN, HIGH);
+    digitalWrite(LED_RX_PIN, LOW); // OK2ZAW: RX LED off--opposite of PTT_PIN
     // we will stay in the mark state for some amount of time
     // before sending the first start bit of the first character
     delay(pttLeadMillis);
@@ -1028,6 +1076,7 @@ void setPTT(byte b)
     digitalWrite(PTT_PA_PIN, LOW); // OK2ZAW mod PTT sequencer
     delay (ptt_PA_TailMillis);
     digitalWrite(PTT_PIN, LOW); // drop PTT
+    digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX LED on--opposite of PTT_PIN
     digitalWrite(FSK_PIN, space);
     delay (pttTailMillis);
     stopBitCounter = 0;
