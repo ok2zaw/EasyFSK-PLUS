@@ -35,8 +35,26 @@ Pin assignment (11 = FSK, 13 = PTT) is kept compatible with K3NG's
 ## Status LCD
 
 A 16x2 character LCD on a PCF8574 I2C backpack (address `0x27`) is wired to
-the Nano's hardware I2C pins (A4/SDA, A5/SCL) and shows the board's current
-state:
+the Nano's hardware I2C pins (A4/SDA, A5/SCL).
+
+### Boot splash
+
+On every power-up/reset, before the board signals "ready" to the PC, the
+LCD runs a fixed splash sequence (`lcdShowSplash()`, called once from
+`setup()`):
+
+1. `EasyFSK PLUS` / `by QRO.CZ` — 2 seconds
+2. `Firmware version` / the version number — 1 second
+3. PTT lead / PTT tail (ms) — 1.5 seconds
+4. PA lead / PA tail (ms) — 1.5 seconds
+5. Baud rate / FSK polarity — 1.5 seconds
+
+About 7.5 seconds total. This only runs in `setup()`, well before any FSK
+keying, so the `delay()` calls it uses are safe — see the timing note below.
+
+### Runtime status
+
+After the splash, the LCD shows the board's current state:
 
 - Line 1, columns 1-6: the configured [callsign](#configuration-menu) (or
   `CALL` if none is set). Column 7 is a blank separator.

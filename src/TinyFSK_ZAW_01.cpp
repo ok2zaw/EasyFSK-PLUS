@@ -21,6 +21,9 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
 Revisions:
+2.11.0: ZAW_01: Added LCD boot splash (setup()-only, before Serial "cmd:"
+        ready signal): brand for 2s, FW version for 1s, then PTT lead/tail,
+        PA lead/tail, and baud/polarity, 1.5s each.
 2.10.0: ZAW_01: Status LCD layout: callsign now columns 1-6, one blank
         separator column, PTT source detail now columns 8-16: "TNC " +
         2-digit baud + "b " + polarity when TNC-sourced (e.g. "TNC 45b H"),
@@ -71,7 +74,8 @@ Revisions:
 #include "LiquidCrystal_I2C.h"
 #include <string.h>
 
-#define VERSION "2.10.0 - OK2ZAW mods."
+#define FW_VERSION "2.11.0"
+#define VERSION FW_VERSION " - OK2ZAW mods."
 
 // OK2ZAW mod: external status LCD--16x2 character display on a PCF8574
 // I2C backpack. Wired to the Nano's hardware I2C pins (A4=SDA, A5=SCL).
@@ -223,6 +227,7 @@ boolean requiresFigures(byte asciiByte);
 void setPTT(byte b);
 boolean isInhibited();
 void lcdShowStatus(const char* line2);
+void lcdShowSplash();
 void echo(byte b);
 
 /******************************************************
@@ -489,6 +494,7 @@ void setup()
   Wire.begin(); // OK2ZAW: I2C for the status LCD
   lcd.init();
   lcd.backlight();
+  lcdShowSplash(); // OK2ZAW: ~7.5s boot splash (brand, FW version, PTT/PA/baud settings)
 
   Serial.write("\ncmd:\n"); // Tell N1MM we are in "RX" mode.  This will be sent
                             // at the end of transmission.
@@ -1304,6 +1310,62 @@ void setPTT(byte b)
 boolean isInhibited()
 {
   return digitalRead(CPU_INH_PIN) == LOW;
+}
+
+/**
+* OK2ZAW mod: one-time boot splash shown on the LCD before normal RX/TX
+* status display begins. Only ever called from setup(), before the timer
+* and Serial "cmd:" ready signal--never from the FSK bit-timing path (see
+* the note on getNextSendChar()), so the delay() calls here are safe.
+*/
+void lcdShowSplash()
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("EasyFSK PLUS"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("by QRO.CZ"));
+  delay(2000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Firmware version"));
+  lcd.setCursor(0, 1);
+  lcd.print(F(FW_VERSION));
+  delay(1000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("PTT L:"));
+  lcd.print(pttLeadMillis);
+  lcd.print(F("ms"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("PTT T:"));
+  lcd.print(pttTailMillis);
+  lcd.print(F("ms"));
+  delay(1500);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("PA  L:"));
+  lcd.print(ptt_PA_LeadMillis);
+  lcd.print(F("ms"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("PA  T:"));
+  lcd.print(ptt_PA_TailMillis);
+  lcd.print(F("ms"));
+  delay(1500);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Baud: "));
+  lcd.print(baudrate);
+  lcd.setCursor(0, 1);
+  lcd.print(F("Polarity: "));
+  lcd.print(mark == HIGH ? F("H") : F("L"));
+  delay(1500);
+
+  lcd.clear();
 }
 
 /**
