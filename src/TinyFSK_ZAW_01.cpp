@@ -21,6 +21,22 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
 Revisions:
+2.15.0: ZAW_01: Status LCD line 1 TNC-sourced label changed from "TNC" to
+        "FSK" (e.g. "FSK 45b H")--RTS-sourced label ("RTS DIGI") unchanged.
+2.14.0: ZAW_01: Status LCD line 2 text display moved from "live during TX"
+        (2.12.0, which measurably shortened FSK start bits, see prior
+        entry) to "preview of queued text before TX starts"--now driven
+        from the serial-receive handler in loop() while !ptt, never from
+        inside processHalfBit()'s call chain. Genuinely zero timing impact,
+        at the cost of no longer updating once a TX is actually underway.
+2.13.0: ZAW_01: Removed the "inh:" serial status line sent when a TX is
+        blocked or cut short by CPU_INH_PIN. The inhibit behavior itself
+        (blocking/force-stopping keying) and the LCD "INHIBITED" display
+        are unchanged--only the serial notification was removed.
+2.12.0: ZAW_01: Status LCD line 2 shows the live TX text again for a
+        TNC-sourced TX, in place of "TX"--this time as a single-character
+        write per character (not a full-line redraw) to keep the residual
+        I2C time inside the bit-timing path as small as possible.
 2.11.0: ZAW_01: Added LCD boot splash (setup()-only, before Serial "cmd:"
         ready signal): brand for 2s, FW version for 1s, then PTT lead/tail,
         PA lead/tail, and baud/polarity, 1.5s each.
@@ -74,7 +90,7 @@ Revisions:
 #include "LiquidCrystal_I2C.h"
 #include <string.h>
 
-#define FW_VERSION "2.11.0"
+#define FW_VERSION "2.15.0"
 #define VERSION FW_VERSION " - OK2ZAW mods."
 
 // OK2ZAW mod: external status LCD--16x2 character display on a PCF8574
@@ -108,8 +124,8 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 // refuses to key PTT_PIN/PTT_PA_PIN and will not clock any data out
 // FSK_PIN--checked before every key-up, and polled continuously so an
 // in-progress TX is force-stopped immediately if this becomes asserted
-// mid-transmission. The PC is told via a distinct "inh:" status line
-// whenever a TX request is blocked or an in-progress TX is cut short by it.
+// mid-transmission. Shown on the status LCD ("INHIBITED"); no serial
+// notification is sent for it.
 // Internal pull-up, so a disconnected pin defaults to "not inhibited".
 // Arduino pin D3 = ATmega328 pin 1 (PD3).  Active LOW.
 #define CPU_INH_PIN 3
@@ -228,6 +244,8 @@ void setPTT(byte b);
 boolean isInhibited();
 void lcdShowStatus(const char* line2);
 void lcdShowSplash();
+void lcdResetTxLine();
+void lcdAppendTxChar(byte b);
 void echo(byte b);
 
 /******************************************************
@@ -460,6 +478,11 @@ boolean callsignEntryHasChars = false;  // false if user pressed Enter with no c
 // line 1 without needing to know the current TX/RX state.
 const char* lcdLastLine2 = "RX";
 
+// OK2ZAW mod: current write column (0-15) on LCD line 2 for the live
+// pre-TX text preview--see lcdAppendTxChar(). Wraps back to 0 (and starts
+// overwriting from the left again) once it reaches LCD_COLS.
+byte lcdTxCol = 0;
+
 /*********************************************************************
 Main execution
 ***********************************************************************/
@@ -532,7 +555,6 @@ void loop()
     resetChar();
     currentShiftState = SHIFT_UNKNOWN;
     lastAsciiByteSent = 0;
-    Serial.write("\ninh:\n"); // OK2ZAW: tell the PC the TX was cut by the inhibit input
     Serial.write("\ncmd:\n"); // Tells N1MM that TX is finished
     lcdShowStatus("INHIBITED"); // OK2ZAW
   }
@@ -619,6 +641,12 @@ void loop()
       else  // character to TX, so add to send buffer
       {
         addToSendBuffer(b);
+        // OK2ZAW: preview queued text on the LCD before it's transmitted.
+        // Only while not already transmitting--once ptt is true this is
+        // skipped entirely, so it can never land inside the bit-timing
+        // path (contrast with the reverted in-TX version; see the note on
+        // getNextSendChar()).
+        if (!ptt) lcdAppendTxChar(b);
       }
     }
   }
@@ -1167,9 +1195,14 @@ void addToSendBuffer(byte newByte)
 * OK2ZAW note: this runs inside processHalfBit(), on the critical path
 * between one half-bit timer tick and the next FSK_PIN transition. Do NOT
 * add LCD/I2C calls (or anything else slow/blocking) here or anywhere else
-* called from processHalfBit()--it directly jitters TX bit timing. LCD
-* updates belong in setPTT() instead, where they land inside the deliberate
-* PA/PTT lead-tail delays, not between bits.
+* called from processHalfBit()--it directly jitters TX bit timing (measured:
+* one lcd.print() of a single character is ~1.9ms of I2C traffic with
+* LiquidCrystal_I2C's 4-bit mode, ~3.8ms if a setCursor() is also needed--a
+* real, measured 9-28% shortening of whatever bit it lands on, worst at 75
+* baud). This was tried for a live TX-text display and reverted for exactly
+* that reason--see lcdAppendTxChar(), now called from the serial-receive
+* path in loop() instead, where it's genuinely free of this risk. Any LCD
+* update belongs in setPTT() or loop() outside this call chain, not here.
 */
 byte getNextSendChar()
 {
@@ -1270,7 +1303,6 @@ void setPTT(byte b)
   {  // PTT ON
     if (isInhibited()) // OK2ZAW: refuse to key up while inhibited
     {
-      Serial.write("\ninh:\n"); // tell the PC we can't send--inhibited
       lcdShowStatus("INHIBITED"); // OK2ZAW
       return;
     }
@@ -1291,6 +1323,7 @@ void setPTT(byte b)
     digitalWrite(PTT_PIN, LOW); // drop PTT
     digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX LED on--opposite of PTT_PIN
     lcdShowStatus("RX"); // OK2ZAW
+    lcdResetTxLine(); // OK2ZAW: back in RX--ready to preview the next queued text from column 1
     digitalWrite(FSK_PIN, space);
     delay (pttTailMillis);
     stopBitCounter = 0;
@@ -1372,9 +1405,9 @@ void lcdShowSplash()
 * OK2ZAW mod: refreshes the status LCD. Line 1, columns 1-6, show the
 * configured callsign (or "CALL" if none is set); column 7 is a blank
 * separator. Columns 8-16 (9 columns) show the current PTT source:
-*   - TNC (this board's own serial/Baudot engine, the [/]/\ commands):
-*     "TNC " + two-digit baud rate + "b " + polarity ("H" or "L"), e.g.
-*     "TNC 45b H"--fills all 9 columns exactly.
+*   - TNC-sourced (this board's own serial/Baudot engine, the [ ] \
+*     commands): "FSK " + two-digit baud rate + "b " + polarity ("H" or
+*     "L"), e.g. "FSK 45b H"--fills all 9 columns exactly.
 *   - RTS (PTT_USB_RTS_PIN, an external TNC's RTS line): "RTS DIGI" (8
 *     chars, column 16 left blank)--baud/polarity are this board's own
 *     internal FSK generator settings and don't apply to an external TNC,
@@ -1402,9 +1435,9 @@ void lcdShowStatus(const char* line2)
   else
   {
     byte baudInt = (byte) baudrate;  // 45, 50, or 75--exactly two digits for all supported rates
-    line1[pos++] = 'T';                          // column 8
-    line1[pos++] = 'N';                          // column 9
-    line1[pos++] = 'C';                          // column 10
+    line1[pos++] = 'F';                          // column 8
+    line1[pos++] = 'S';                          // column 9
+    line1[pos++] = 'K';                          // column 10
     line1[pos++] = ' ';                           // column 11
     line1[pos++] = '0' + (baudInt / 10);          // column 12: baud tens digit
     line1[pos++] = '0' + (baudInt % 10);          // column 13: baud ones digit
@@ -1421,6 +1454,43 @@ void lcdShowStatus(const char* line2)
   lcd.setCursor(0, 1);
   lcd.print(line2);
   for (byte i = strlen(line2); i < LCD_COLS; i++) lcd.print(' ');
+}
+
+/**
+* OK2ZAW mod: resets the live TX-preview column (lcdTxCol) to the start of
+* line 2. Called when returning to RX, right after lcdShowStatus() has
+* already written "RX" there, so the next batch of queued text previews
+* from column 1. Just a variable write--no I2C--so it's harmless wherever
+* it's called from, including from inside setPTT() when that runs from the
+* processHalfBit() call chain (natural end of buffer).
+*/
+void lcdResetTxLine()
+{
+  lcdTxCol = 0;
+}
+
+/**
+* OK2ZAW mod: appends one character to LCD line 2 at the live TX-preview
+* cursor, wrapping back to column 1 (overwriting from the left again) once
+* the line is full. Non-printable bytes render as a blank.
+*
+* Called from loop(), in the serial-receive handler, only while !ptt (see
+* call site)--i.e. this previews text queued for an upcoming TX, before
+* it's actually transmitted. This is NOT called from getNextSendChar()/
+* processHalfBit() (that was tried and reverted--see the note on
+* getNextSendChar() for the measured cost). Because it only ever runs
+* while ptt is false, processHalfBit() is a no-op for the whole time this
+* function could possibly be called, so there is no bit-timing path for
+* it to interfere with--this is genuinely free of the earlier tradeoff,
+* not just a smaller version of it.
+*/
+void lcdAppendTxChar(byte b)
+{
+  if (b < 0x20 || b > 0x7E) b = ' ';  // render non-printable as blank
+  if (lcdTxCol == 0) lcd.setCursor(0, 1);
+  lcd.print((char) b);
+  lcdTxCol++;
+  if (lcdTxCol >= LCD_COLS) lcdTxCol = 0;  // wrap--next char restarts at column 1
 }
 
 /**

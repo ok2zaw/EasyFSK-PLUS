@@ -11,7 +11,7 @@ logging/RTTY program (e.g. N1MM+, FLDIGI).
 | Arduino pin | ATmega328 pin | Define             | Direction | Function                                                        |
 |-------------|----------------|--------------------|-----------|-------------------------------------------------------------------|
 | D2          | 32 (PD2)       | `PTT_USB_RTS_PIN`  | INPUT     | Hardware PTT-request input, e.g. from the RTS line of an external/alternate TNC's USB-serial adapter. External pull-up; **active LOW**. Engages the same PA/PTT lead-tail sequencer as the `[`/`]` serial commands, without going through this board's own serial port or internal FSK generator |
-| D3          | 1 (PD3)        | `CPU_INH_PIN`      | INPUT     | Hardware inhibit input. Internal pull-up; **active LOW**. While asserted, blocks all PTT/FSK keying and force-stops an in-progress TX immediately; the PC is notified with an `inh:` status line |
+| D3          | 1 (PD3)        | `CPU_INH_PIN`      | INPUT     | Hardware inhibit input. Internal pull-up; **active LOW**. While asserted, blocks all PTT/FSK keying and force-stops an in-progress TX immediately; shown on the status LCD as `INHIBITED` |
 | D4          | 2 (PD4)        | `LED_RX_PIN`       | OUTPUT    | Receive indicator LED. **Active HIGH.** Always the opposite state of `PTT_PIN` — lit while receiving, off while transmitting |
 | D8          | —              | `ON_PIN`           | OUTPUT    | Reserved (configured as output at startup, not yet driven by firmware) |
 | D10         | —              | `PTT_PA_PIN`       | OUTPUT    | PA/amplifier keying — first relay closed, last relay opened (outer stage of the sequence) |
@@ -60,21 +60,41 @@ After the splash, the LCD shows the board's current state:
   `CALL` if none is set). Column 7 is a blank separator.
 - Line 1, columns 8-16 (9 columns): current PTT source, with detail —
   - TNC-sourced (this board's own serial/Baudot engine, the `[`/`]`/`\`
-    commands): `TNC ` + 2-digit baud rate + `b ` + FSK polarity, e.g.
-    `TNC 45b H` (45.45 baud, mark = HIGH) — fills all 9 columns exactly.
+    commands): `FSK ` + 2-digit baud rate + `b ` + FSK polarity, e.g.
+    `FSK 45b H` (45.45 baud, mark = HIGH) — fills all 9 columns exactly.
   - RTS-sourced ([`PTT_USB_RTS_PIN`](#alternate-ptt-source-ptt_usb_rts_pin),
     an external TNC's RTS line): `RTS DIGI` — baud/polarity are this
     board's own internal FSK generator settings and don't apply to an
     external TNC, so a generic `DIGI` label is shown instead. Column 16 is
     blank (the string is 8 chars).
-- Line 2: `RX`, `TX`, or `INHIBITED`
+- Line 2, when idle: `RX` or `INHIBITED`.
+- Line 2, while text is queued for an upcoming TX (typed/sent over serial
+  but not yet transmitted): a live preview of that text, one character at a
+  time as each byte is received. Fills left to right; once column 16 is
+  reached it wraps back to column 1 and starts overwriting from the left
+  again (not a scrolling window — a full lap of up to 16 characters at a
+  time). Resets to column 1 each time the board returns to RX, ready for
+  the next batch.
+- Line 2, once a TX actually starts: just `TX` — the preview above only
+  ever updates while `!ptt`, so it never appears live during an active
+  transmission (this is deliberate, see below).
 
-Line 1 and line 2 are only ever updated at PTT transitions (key-up/key-down)
-and other non-time-critical moments (e.g. a callsign change) — deliberately
-never from inside `processHalfBit()`/`getNextSendChar()`, since an I2C write
-there would jitter the FSK bit timing. See the note on `getNextSendChar()`
-in [src/TinyFSK_ZAW_01.cpp](src/TinyFSK_ZAW_01.cpp) before adding any new
-LCD content that would need per-character updates during TX.
+Both lines are only ever updated at PTT transitions (key-up/key-down), from
+the serial-receive handler in `loop()` (the preview above), or other
+non-time-critical moments (e.g. a callsign change) — never from inside
+`processHalfBit()`'s call chain. An earlier version showed the text live
+*during* TX instead, by writing to the LCD from `getNextSendChar()`
+(inside `processHalfBit()`), which measurably shortened whatever start bit
+it landed on — `LiquidCrystal_I2C` writes in 4-bit mode, so one character
+costs ~1.9ms of I2C traffic (~3.8ms on a line-wrap character needing a
+`setCursor()`), and because the timer hardware ticks on its own fixed
+schedule regardless, that time came directly out of the bit's own duration:
+roughly 9-14% shortened normally, 17-28% on a wrap character, worst at 75
+baud. That version was reverted in favor of the preview-before-TX design
+here, which is genuinely free of that risk since `processHalfBit()` is a
+no-op the entire time the preview could possibly run. See the notes on
+`getNextSendChar()` and `lcdAppendTxChar()` in
+[src/TinyFSK_ZAW_01.cpp](src/TinyFSK_ZAW_01.cpp) before changing this again.
 
 Requires the `marcoschwartz/LiquidCrystal_I2C` library (declared in
 [platformio.ini](platformio.ini) `lib_deps`, installed automatically by
@@ -148,10 +168,11 @@ pull-up, so an unconnected pin defaults to "not inhibited."
 - If the inhibit line asserts **during** a transmission, the board force-stops
   immediately — bypassing the configured PTT/PA tail delays, since this is a
   safety cutoff rather than a normal end of TX — and clears the send buffer.
-- Either way, the PC is told via a distinct status line: `inh:` (in addition
-  to the usual `cmd:` line once back in RX). Watch for it if you're
-  integrating with logging software, to distinguish "inhibited" from a
-  normal end of transmission.
+- Either way, the status LCD shows `INHIBITED`; the usual `cmd:` line is
+  still sent over serial once back in RX, but there's no separate serial
+  notification distinguishing an inhibited stop from a normal end of TX —
+  watch the LCD (or the hardware pin itself) if your integration needs to
+  tell the two apart.
 
 ## Building & Uploading
 
