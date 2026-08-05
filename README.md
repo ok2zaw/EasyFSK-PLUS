@@ -78,7 +78,9 @@ After the splash, the LCD shows the board's current state:
 
 - Line 1, columns 1-6: the configured [callsign](#configuration-menu) (or
   `CALL` if none is set). Column 7 is a blank separator.
-- Line 1, columns 8-16 (9 columns): current PTT source, with detail —
+- Line 1, columns 8-16 (9 columns): most-recently-used PTT source (sticky —
+  see [Alternate PTT source](#alternate-ptt-source-ptt_usb_rts_pin) for
+  exactly when it switches), with detail —
   - TNC-sourced (this board's own serial/Baudot engine, the `[`/`]`/`\`
     commands): `FSK ` + 2-digit baud rate + `b ` + FSK polarity, e.g.
     `FSK 45b H` (45.45 baud, mark = HIGH) — fills all 9 columns exactly.
@@ -202,7 +204,21 @@ out.
 This input is ignored while the `~` configuration menu is open, and does not
 interact with the Baudot send buffer — it only drives the PA/PTT relay
 sequencing, so it is not affected by anything queued for the internal FSK
-generator.
+generator. `FSK_PIN` itself is held statically **LOW** for the whole
+RTS-sourced transmission (not the configured "mark" polarity level, which
+could be HIGH depending on your polarity setting) — `processHalfBit()`
+skips the internal Baudot bit-banging entirely while RTS-sourced, rather
+than idling out diddle characters on it.
+
+The LCD's line-1 source label (`RTS DIGI` vs `FSK ...`) is sticky, not a
+live snapshot: once RTS triggers a key-up, it keeps showing `RTS DIGI`
+through any number of subsequent RX periods, even after that RTS-sourced
+TX ends — it only switches back to `FSK ...` once the UART actually
+receives a data byte bound for FSK transmission (i.e. real serial-sourced
+traffic, not just a `[`/`]` control character). This reflects which path
+was most recently *used*, so at a glance you can tell whether the board is
+currently set up for external-TNC or internal-TNC operation, not just
+what's happening in the current instant.
 
 ### Hardware inhibit: `CPU_INH_PIN`
 

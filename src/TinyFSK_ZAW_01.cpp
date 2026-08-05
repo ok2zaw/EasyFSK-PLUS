@@ -20,14 +20,26 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
-2.23.0: ZAW_01: Fixed a bug where the LCD's pre-TX text preview and the
-        live during-TX text display could show the same characters twice
-        (once quickly during the PA/PTT lead delay, again slowly as they
-        were actually transmitted). setPTT(true) now clears line 2 right
-        before real bit-banging starts, so the live display always starts
-        clean. lcdResetTxLine() now actually blanks the LCD line, not just
-        the internal column counter.
+2.28.0: ZAW_01: FSK_PIN is now held literally LOW (not the configured
+        "mark" polarity level, which could be HIGH) for the entire
+        duration of an RTS-sourced TX--at key-up in setPTT(), at unkey in
+        setPTT() (covers TX_ABORT while RTS is still asserted), and at the
+        inhibit force-stop path in loop(). No effect on TNC-sourced TX.
 Revisions:
+2.27.0: ZAW_01: Added lastPttWasRts, a sticky version of rtsKeyed for the
+        LCD source label only. Line 1 now keeps showing "RTS DIGI" across
+        any number of subsequent RX periods after an RTS-sourced TX, not
+        just during it--switching back to "FSK ..." only once the UART
+        actually receives a data byte bound for FSK transmission (see
+        addToSendBuffer()). rtsKeyed itself is unchanged and still governs
+        the actual bit-banging skip in processHalfBit().
+2.26.0: ZAW_01: Fixed a bug where FSK_PIN was actively bit-banging idle
+        diddle characters for the entire duration of an RTS-sourced TX
+        (PTT_USB_RTS_PIN), contradicting the documented behavior that
+        RTS-sourced keying doesn't use the internal Baudot/FSK generator
+        at all. processHalfBit() now also returns immediately when
+        rtsKeyed is true, leaving FSK_PIN at its static post-key-up mark
+        level for the whole transmission instead.
 2.25.0: ZAW_01: Added serial commands D/d to enable/disable live TX text
         on the status LCD (persisted to EEPROM, default on). When off,
         getNextSendChar() skips the lcdAppendTxChar() call entirely--no
@@ -39,6 +51,13 @@ Revisions:
         text into the send buffer, just don't show it early). Line 2 now
         shows *only* live text, one character at a time as it's actually
         transmitted, starting from a blank line for every new TX.
+2.23.0: ZAW_01: Fixed a bug where the LCD's pre-TX text preview and the
+        live during-TX text display could show the same characters twice
+        (once quickly during the PA/PTT lead delay, again slowly as they
+        were actually transmitted). setPTT(true) now clears line 2 right
+        before real bit-banging starts, so the live display always starts
+        clean. lcdResetTxLine() now actually blanks the LCD line, not just
+        the internal column counter.
 2.22.0: ZAW_01: PTT_PIN and PTT_PA_PIN are now forced LOW (unkeyed) as the
         very first thing in setup(), before Serial/EEPROM/timer/LCD--
         previously PTT_PA_PIN had no explicit boot-time LOW write at all
@@ -149,7 +168,7 @@ Revisions:
 #include "LiquidCrystal_I2C.h"
 #include <string.h>
 
-#define FW_VERSION "2.25.0"
+#define FW_VERSION "2.28.0"
 #define VERSION FW_VERSION " - OK2ZAW mods."
 
 // OK2ZAW mod: external status LCD--16x2 character display on a PCF8574
@@ -515,6 +534,14 @@ boolean ptt = false; // Keeps track of PTT state (true = Transmitter is on)
 // (rather than by the [/] serial commands), so we know it's ours to release.
 boolean rtsKeyed = false;
 
+// OK2ZAW mod: sticky version of the above, for the LCD source label only.
+// Unlike rtsKeyed (which clears the moment the RTS-sourced TX ends), this
+// stays true--continuing to show "RTS DIGI" on line 1--across any number
+// of subsequent RX periods, until the UART actually receives a data byte
+// bound for FSK transmission (see addToSendBuffer()). Set true the moment
+// PTT_USB_RTS_PIN triggers a key-up.
+boolean lastPttWasRts = false;
+
 volatile boolean isrFlag = false;   //set by timer interrupt.  Set high every 1/2 bit
                                     //to indicate when we should exectute the bit-banging
                                     //routine.  This is handled in the main loop function.
@@ -643,7 +670,7 @@ void loop()
       digitalWrite(PTT_PA_PIN, LOW);
       digitalWrite(PTT_PIN, LOW);
       digitalWrite(LED_RX_PIN, HIGH);
-      digitalWrite(FSK_PIN, space);
+      digitalWrite(FSK_PIN, rtsKeyed ? LOW : space); // OK2ZAW: hold FSK_PIN LOW, not "space", while RTS-sourced
       ptt = false;
       rtsKeyed = false;
       resetSendBuffer();
@@ -672,6 +699,7 @@ void loop()
     if (rtsAsserted && !ptt)
     {
       rtsKeyed = true;
+      lastPttWasRts = true; // OK2ZAW: sticky--see declaration comment
       endWhenBufferEmpty = false;
       setPTT(true);
     }
@@ -1193,6 +1221,15 @@ void processHalfBit() {
     return;
   }
 
+  if (rtsKeyed)  // OK2ZAW: RTS-sourced TX doesn't use this board's internal
+                 // Baudot generator at all--leave FSK_PIN alone (already
+                 // sitting at its post-key-up mark level from setPTT()),
+                 // instead of bit-banging idle diddles onto it for the
+                 // whole transmission.
+  {
+    return;
+  }
+
   if (midBit)
   {
    midBit = false; // reset the flag.  Next time we need to send the next bit.
@@ -1301,6 +1338,14 @@ void resetSendBuffer()
 /**
 * Adds a new byte to the transmit text buffer.  These
 * are *ASCII* bytes from the terminal, not Baudot.
+*
+* OK2ZAW mod: this is the UART "received a data byte bound for FSK
+* transmission" event--only ever called for real data (never for control
+* characters [ ] \ ~, which are handled elsewhere and never reach here).
+* If the sticky RTS source label is currently showing, switch it back and
+* refresh line 1 right away. Called only from loop()'s serial-receive
+* handler and waitDrainingSerial(), never from the bit-timing path, so the
+* LCD write here is safe--see the note on getNextSendChar().
 */
 void addToSendBuffer(byte newByte)
 {
@@ -1308,6 +1353,11 @@ void addToSendBuffer(byte newByte)
   {
     sendBufferBytes++;
     sendBufferArray[sendBufferBytes - 1] = newByte;
+  }
+  if (lastPttWasRts)
+  {
+    lastPttWasRts = false;
+    lcdRefreshLine1();
   }
 }
 
@@ -1476,7 +1526,11 @@ void setPTT(byte b)
     }
     digitalWrite(PTT_PA_PIN, HIGH); // OK2ZAW mod PTT sequencer
     waitDrainingSerial(ptt_PA_LeadMillis); // OK2ZAW: was delay()--see function comment
-    digitalWrite(FSK_PIN, mark);  //always start in mark state
+    // OK2ZAW: RTS-sourced TX never bit-bangs FSK_PIN (see processHalfBit()),
+    // so hold it LOW here instead of the usual "always start in mark
+    // state"--mark could be HIGH depending on configured polarity, and
+    // FSK_PIN is unused for the whole RTS-sourced session either way.
+    digitalWrite(FSK_PIN, rtsKeyed ? LOW : mark);
     digitalWrite(PTT_PIN, HIGH);
     digitalWrite(LED_RX_PIN, LOW); // OK2ZAW: RX LED off--opposite of PTT_PIN
     // OK2ZAW: line 1 only--line 2 keeps showing "RX"/"INHIBIT" (whatever
@@ -1505,7 +1559,11 @@ void setPTT(byte b)
     inhibitShown = isInhibited();
     lcdShowStatus(inhibitShown ? "INHIBIT" : "RX"); // OK2ZAW
     lcdResetTxLine(); // OK2ZAW: back in RX--ready for the next TX's live text from column 1
-    digitalWrite(FSK_PIN, space);
+    // OK2ZAW: rtsKeyed can still be true here if this came from TX_ABORT
+    // while RTS was still asserted (the normal end-of-buffer path already
+    // clears rtsKeyed before this runs)--hold FSK_PIN LOW rather than
+    // "space" in that case, same reasoning as the key-up write above.
+    digitalWrite(FSK_PIN, rtsKeyed ? LOW : space);
     delay (pttTailMillis);
     stopBitCounter = 0;
     bitPos = -1;
@@ -1585,8 +1643,11 @@ void lcdShowSplash()
 /**
 * OK2ZAW mod: refreshes LCD line 1 only. Columns 1-6 show the configured
 * callsign (or "CALL" if none is set); column 7 is a blank separator.
-* Columns 8-16 (9 columns) show the current PTT source:
-*   - TNC-sourced (this board's own serial/Baudot engine, the [ ] \
+* Columns 8-16 (9 columns) show the PTT source--sticky, per lastPttWasRts
+* (not the transient rtsKeyed): whichever of RTS/serial was used most
+* recently, staying on screen across RX periods until the other one is
+* actually used again (see lastPttWasRts's declaration comment):
+*   - TNC/serial-sourced (this board's own serial/Baudot engine, the [ ] \
 *     commands): "FSK " + two-digit baud rate + "b " + polarity ("H" or
 *     "L"), e.g. "FSK 45b H"--fills all 9 columns exactly.
 *   - RTS (PTT_USB_RTS_PIN, an external TNC's RTS line): "RTS DIGI" (8
@@ -1606,7 +1667,7 @@ void lcdRefreshLine1()
   for (byte i = 0; callsignField[i] != '\0' && pos < 6; i++) line1[pos++] = callsignField[i];
   while (pos < 7) line1[pos++] = ' ';  // column 7: blank separator
 
-  if (rtsKeyed)
+  if (lastPttWasRts)
   {
     const char* src = "RTS DIGI";  // columns 8-15 (8 chars); column 16 padded blank below
     for (byte i = 0; src[i] != '\0'; i++) line1[pos++] = src[i];
