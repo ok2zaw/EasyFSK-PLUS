@@ -11,7 +11,7 @@ logging/RTTY program (e.g. N1MM+, FLDIGI).
 | Arduino pin | ATmega328 pin | Define             | Direction | Function                                                        |
 |-------------|----------------|--------------------|-----------|-------------------------------------------------------------------|
 | D2          | 32 (PD2)       | `PTT_USB_RTS_PIN`  | INPUT     | Hardware PTT-request input, e.g. from the RTS line of an external/alternate TNC's USB-serial adapter. External pull-up; **active LOW**. Engages the same PA/PTT lead-tail sequencer as the `[`/`]` serial commands, without going through this board's own serial port or internal FSK generator |
-| D3          | 1 (PD3)        | `CPU_INH_PIN`      | INPUT     | Hardware inhibit input. Internal pull-up; **active LOW**. While asserted, blocks all PTT/FSK keying and force-stops an in-progress TX immediately; shown on the status LCD as `INHIBITED` |
+| D3          | 1 (PD3)        | `CPU_INH_PIN`      | INPUT     | Hardware inhibit input. Internal pull-up; **active LOW**. While asserted, blocks all PTT/FSK keying and force-stops an in-progress TX immediately; shown on the status LCD as `INHIBIT` |
 | D4          | 2 (PD4)        | `LED_RX_PIN`       | OUTPUT    | Receive indicator LED. **Active HIGH.** Always the opposite state of `PTT_PIN` — lit while receiving, off while transmitting |
 | D8          | —              | `ON_PIN`           | OUTPUT    | Reserved (configured as output at startup, not yet driven by firmware) |
 | D10         | —              | `PTT_PA_PIN`       | OUTPUT    | PA/amplifier keying — first relay closed, last relay opened (outer stage of the sequence) |
@@ -52,6 +52,26 @@ LCD runs a fixed splash sequence (`lcdShowSplash()`, called once from
 About 7.5 seconds total. This only runs in `setup()`, well before any FSK
 keying, so the `delay()` calls it uses are safe — see the timing note below.
 
+### Boot safety for PTT
+
+`PTT_PIN` and `PTT_PA_PIN` are forced `LOW` (unkeyed) as the very first
+thing `setup()` does — before `Serial.begin()`, EEPROM loading, the timer,
+or the LCD. Keying can only ever be *commanded* (via `[` or
+`PTT_USB_RTS_PIN`) from `loop()`, which the Arduino runtime cannot start
+running until `setup()` — including the full ~7.5s boot splash above — has
+returned. So a serial-triggered auto-reset (common on Nano-style boards:
+opening the port toggles DTR, which resets the board) can't result in an
+unwanted key-up before the board is fully back up and showing its main
+status screen.
+
+The one thing firmware can't cover: the brief window (a few hundred ms,
+board-dependent) where the *bootloader itself* is running, before this
+sketch has started executing at all. Those pins are floating (not
+actively driven) during that window. If that matters for your PTT
+circuit, add an external pull-down resistor on `PTT_PIN`/`PTT_PA_PIN` as a
+hardware-level guard — firmware has no way to control a window before it
+has started running.
+
 ### Runtime status
 
 After the splash, the LCD shows the board's current state:
@@ -67,34 +87,63 @@ After the splash, the LCD shows the board's current state:
     board's own internal FSK generator settings and don't apply to an
     external TNC, so a generic `DIGI` label is shown instead. Column 16 is
     blank (the string is 8 chars).
-- Line 2, when idle: `RX` or `INHIBITED`.
-- Line 2, while text is queued for an upcoming TX (typed/sent over serial
-  but not yet transmitted): a live preview of that text, one character at a
-  time as each byte is received. Fills left to right; once column 16 is
-  reached it wraps back to column 1 and starts overwriting from the left
-  again (not a scrolling window — a full lap of up to 16 characters at a
-  time). Resets to column 1 each time the board returns to RX, ready for
-  the next batch.
-- Line 2, once a TX actually starts: just `TX` — the preview above only
-  ever updates while `!ptt`, so it never appears live during an active
-  transmission (this is deliberate, see below).
+- Line 2, when idle: `RX`, or `INHIBIT` whenever [`CPU_INH_PIN`](#hardware-inhibit-cpu_inh_pin)
+  is asserted — reflected continuously and immediately, not just when it
+  happens to block or interrupt a TX.
+- Line 2, while queuing up for a TX (during the PA/PTT lead delay, before
+  the first FSK bit goes out): still shows `RX`/`INHIBIT` — text arriving
+  over serial is queued into the send buffer during this time, but not
+  shown yet.
+- Line 2, once a TX's first FSK bit actually goes out (TNC-sourced only):
+  **live** text, and only that — updated as each character is actually
+  sent to `FSK_PIN`, starting from a blank line for every new TX (cleared
+  right before real bit-banging begins). An RTS-sourced TX just keeps
+  whatever was last shown, since that text doesn't pass through this
+  board's Baudot engine.
 
-Both lines are only ever updated at PTT transitions (key-up/key-down), from
-the serial-receive handler in `loop()` (the preview above), or other
-non-time-critical moments (e.g. a callsign change) — never from inside
-`processHalfBit()`'s call chain. An earlier version showed the text live
-*during* TX instead, by writing to the LCD from `getNextSendChar()`
-(inside `processHalfBit()`), which measurably shortened whatever start bit
-it landed on — `LiquidCrystal_I2C` writes in 4-bit mode, so one character
-costs ~1.9ms of I2C traffic (~3.8ms on a line-wrap character needing a
-`setCursor()`), and because the timer hardware ticks on its own fixed
-schedule regardless, that time came directly out of the bit's own duration:
-roughly 9-14% shortened normally, 17-28% on a wrap character, worst at 75
-baud. That version was reverted in favor of the preview-before-TX design
-here, which is genuinely free of that risk since `processHalfBit()` is a
-no-op the entire time the preview could possibly run. See the notes on
-`getNextSendChar()` and `lcdAppendTxChar()` in
-[src/TinyFSK_ZAW_01.cpp](src/TinyFSK_ZAW_01.cpp) before changing this again.
+Line 2 fills left to right; once column 16 is reached it wraps back to
+column 1 and starts overwriting from the left again (not a scrolling
+window — a full lap of up to 16 characters at a time). Clears and resets
+to column 1 both when returning to RX and at the start of every new TX.
+
+This live display can be turned off entirely with the `d` command (see
+[Configuration Menu](#configuration-menu)) if you'd rather avoid the timing
+cost below — when disabled, `getNextSendChar()` skips the LCD write call
+completely, not just blanks the display.
+
+**The live-during-TX update is a deliberate, measured timing tradeoff, not
+a free feature.** It writes to the LCD from `getNextSendChar()`, inside
+`processHalfBit()`'s call chain — `LiquidCrystal_I2C` writes in 4-bit mode,
+so one character costs ~1.9ms of I2C traffic (~3.8ms on a line-wrap
+character needing a `setCursor()`), and because the timer hardware ticks
+on its own fixed schedule regardless of how long that takes, the delay
+comes directly out of the following bit's own duration — it's shortened,
+not just delayed:
+
+| Baud  | Bit period | Normal character | Wrap character (every 16th) |
+|-------|-----------|-------------------|-------------------------------|
+| 45.45 | 22.0ms    | ~9% shortened     | ~17% shortened                |
+| 50.0  | 20.0ms    | ~10% shortened    | ~19% shortened                |
+| 75.0  | 13.3ms    | ~14% shortened    | ~28% shortened                |
+
+A word-batched alternative (flush several characters at once, less often)
+was evaluated and rejected: it trades a smaller, bounded per-character cost
+for an unbounded one — a long word/number run with no spaces could flush
+30ms+ in one shot, long enough to stall FSK output across multiple bit
+periods, not just distort one. The fixed, single-character write above is
+the smallest bound achievable while still updating live during TX; if you
+want zero timing risk instead, an earlier design (preview only before TX
+starts, frozen for the rest of the transmission) is documented in the
+2.20.0 entry, and a version that additionally previewed text during the
+PA/PTT lead delay is in the 2.23.0 entry, of the revision history in
+[src/TinyFSK_ZAW_01.cpp](src/TinyFSK_ZAW_01.cpp).
+
+Text arriving during the lead delay is still queued into the send buffer
+by `waitDrainingSerial()` (so it transmits correctly), it just isn't shown
+on the LCD until it's actually sent — see the notes on `getNextSendChar()`,
+`waitDrainingSerial()`, and `lcdAppendTxChar()` in
+[src/TinyFSK_ZAW_01.cpp](src/TinyFSK_ZAW_01.cpp) before changing any of
+this again.
 
 Requires the `marcoschwartz/LiquidCrystal_I2C` library (declared in
 [platformio.ini](platformio.ini) `lib_deps`, installed automatically by
@@ -164,15 +213,17 @@ anything. Wire an external open-drain/relay-contact fault signal (e.g. SWR
 protection, band-data lockout) to this pin; it uses the ATmega328's internal
 pull-up, so an unconnected pin defaults to "not inhibited."
 
+- The status LCD shows `INHIBIT` continuously and immediately whenever the
+  pin is asserted — including while the board is just sitting idle, not
+  just when it happens to block or interrupt a TX.
 - If a key-up is requested while already inhibited, it's simply refused.
 - If the inhibit line asserts **during** a transmission, the board force-stops
   immediately — bypassing the configured PTT/PA tail delays, since this is a
   safety cutoff rather than a normal end of TX — and clears the send buffer.
-- Either way, the status LCD shows `INHIBITED`; the usual `cmd:` line is
-  still sent over serial once back in RX, but there's no separate serial
-  notification distinguishing an inhibited stop from a normal end of TX —
-  watch the LCD (or the hardware pin itself) if your integration needs to
-  tell the two apart.
+- Either way, **nothing is sent to the PC over serial** — no `cmd:` line,
+  no other status text. Only the status LCD reflects it. If your
+  integration needs to detect an inhibited stop in software, watch the
+  hardware pin itself (or the LCD) — the serial stream stays silent.
 
 ## Building & Uploading
 
@@ -198,9 +249,11 @@ configuration menu, then one of:
 | `l`     | Set/get PA lead time, ms (before PTT)        |
 | `t`     | Set/get PA tail time, ms (after PTT)         |
 | `C`     | Set/get operator callsign (max 6 chars)      |
+| `D`     | Enable live TX text on the status LCD        |
+| `d`     | Disable live TX text on the status LCD       |
 
-Speed and polarity apply immediately on keypress. `L`/`T`/`l`/`t`/`C` need a
-value typed in next — see below.
+Speed, polarity, and `D`/`d` apply immediately on keypress. `L`/`T`/`l`/`t`/`C`
+need a value typed in next — see below.
 
 ### Browser configuration tool
 
@@ -209,8 +262,17 @@ that talks to the board over the [Web Serial API](https://developer.mozilla.org/
 no install needed. Open it directly in Chrome, Edge, or Opera (double-click
 the file, or drag it into the browser), click **Connect**, and pick the
 board's serial port. It has controls for the PTT/PA timing values, speed,
-polarity, and a raw-command box for anything not yet covered. Firefox and
-Safari don't support Web Serial, so it won't work there.
+polarity, callsign, the status LCD's live-TX-text toggle, and a
+raw-command box for anything not yet covered. Firefox and Safari don't
+support Web Serial, so it won't work there.
+
+**Show current configuration** (in the Speed & Polarity panel) sends `~?`
+and parses the board's response to fill in the PTT/PA timing fields and
+callsign, and shows baud rate, polarity, and the live-TX-text setting as a
+read-only summary next to the button. Since the firmware echoes that same
+full dump after every set/get, the fields also refresh automatically
+whenever you change something through this tool — no need to click it
+again just to confirm a change took effect.
 
 ## PTT/PA Timing Configuration
 

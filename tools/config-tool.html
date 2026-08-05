@@ -178,6 +178,16 @@
   </div>
 
   <div class="panel">
+    <h2>Status LCD</h2>
+    <div class="row">
+      <label>Live TX text</label>
+      <button data-plain="D" disabled>Enable</button>
+      <button data-plain="d" disabled>Disable</button>
+      <span class="sub">Line 2 shows text live as it's transmitted.</span>
+    </div>
+  </div>
+
+  <div class="panel">
     <h2>Speed &amp; Polarity</h2>
     <div class="row">
       <label>RTTY speed</label>
@@ -193,6 +203,7 @@
     <div class="row">
       <label>&nbsp;</label>
       <button data-plain="?" disabled>Show current configuration</button>
+      <span id="cfg-summary" class="sub"></span>
     </div>
   </div>
 
@@ -249,6 +260,34 @@
     consoleEl.scrollTop = consoleEl.scrollHeight;
   }
 
+  // Matches the "?" config dump from displayConfiguration() in the
+  // firmware (src/TinyFSK_ZAW_01.cpp) -- sent after every "?" query, and
+  // after every config change (set/get), since the firmware echoes the
+  // full dump each time. Parsing every incoming chunk this way means all
+  // fields stay in sync no matter which action produced the dump.
+  const CONFIG_DUMP_RE = /Speed \(baud\):\s*([\d.]+)[\s\S]*?Polarity\s+mark = logical (HIGH|LOW)[\s\S]*?PTT lead \(ms\):\s*(\d+)[\s\S]*?PTT tail \(ms\):\s*(\d+)[\s\S]*?PA lead\s*\(ms\):\s*(\d+)[\s\S]*?PA tail\s*\(ms\):\s*(\d+)[\s\S]*?Callsign:\s*(.*?)[\r\n][\s\S]*?Live LCD text:\s*(on|off)/;
+  const cfgSummary = document.getElementById('cfg-summary');
+  let parseBuffer = '';
+
+  function tryParseConfigDump(chunk) {
+    parseBuffer += chunk;
+    if (parseBuffer.length > 2000) parseBuffer = parseBuffer.slice(-2000); // bounded, one dump is ~250 chars
+    const m = CONFIG_DUMP_RE.exec(parseBuffer);
+    if (!m) return;
+
+    document.getElementById('val-L').value = m[3];
+    document.getElementById('val-T').value = m[4];
+    document.getElementById('val-l').value = m[5];
+    document.getElementById('val-t').value = m[6];
+    const cs = m[7].trim();
+    document.getElementById('val-C').value = (cs === '(not set)') ? '' : cs;
+    cfgSummary.textContent = 'Baud: ' + m[1] + '  ·  Polarity: ' + m[2] + '  ·  Live LCD text: ' + m[8];
+
+    // Drop everything through this match so a later dump doesn't get
+    // matched against leftover text from an earlier one.
+    parseBuffer = parseBuffer.slice(m.index + m[0].length);
+  }
+
   function setConnectedUI(connected) {
     dot.classList.toggle('connected', connected);
     statusText.textContent = connected ? 'Connected' : 'Not connected';
@@ -260,6 +299,7 @@
 
   async function connect() {
     try {
+      parseBuffer = '';
       port = await navigator.serial.requestPort();
       await port.open({ baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' });
 
@@ -284,7 +324,10 @@
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        if (value) log(value);
+        if (value) {
+          log(value);
+          tryParseConfigDump(value);
+        }
       }
     } catch (err) {
       log('\n[read error: ' + err.message + ']\n');

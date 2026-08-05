@@ -20,7 +20,66 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ****************************************************************************
+2.23.0: ZAW_01: Fixed a bug where the LCD's pre-TX text preview and the
+        live during-TX text display could show the same characters twice
+        (once quickly during the PA/PTT lead delay, again slowly as they
+        were actually transmitted). setPTT(true) now clears line 2 right
+        before real bit-banging starts, so the live display always starts
+        clean. lcdResetTxLine() now actually blanks the LCD line, not just
+        the internal column counter.
 Revisions:
+2.25.0: ZAW_01: Added serial commands D/d to enable/disable live TX text
+        on the status LCD (persisted to EEPROM, default on). When off,
+        getNextSendChar() skips the lcdAppendTxChar() call entirely--no
+        I2C traffic at all from that call site, not just a blanked
+        display. Added a matching toggle to tools/config-tool.html.
+2.24.0: ZAW_01: Removed the pre-TX text preview on the status LCD (loop()'s
+        serial handler and waitDrainingSerial(), renamed from
+        waitWithTxPreview(), no longer call lcdAppendTxChar()--still queue
+        text into the send buffer, just don't show it early). Line 2 now
+        shows *only* live text, one character at a time as it's actually
+        transmitted, starting from a blank line for every new TX.
+2.22.0: ZAW_01: PTT_PIN and PTT_PA_PIN are now forced LOW (unkeyed) as the
+        very first thing in setup(), before Serial/EEPROM/timer/LCD--
+        previously PTT_PA_PIN had no explicit boot-time LOW write at all
+        (relied only on the implicit post-reset register default), and
+        PTT_PIN's was set much later in setup(). PTT can still only ever
+        be commanded to key up once loop() starts, which is inherently
+        after setup() (including the full boot splash) completes.
+2.21.0: ZAW_01: Restored live per-character TX text on the status LCD
+        (line 2 updates as each character is actually sent to FSK_PIN,
+        TNC-sourced only), after evaluating and rejecting word-batched
+        alternatives (worse: unbounded flush duration for long words).
+        This is a deliberate, measured, user-accepted timing tradeoff--see
+        the notes on getNextSendChar() and lcdAppendTxChar(): ~1.9ms of
+        I2C traffic per character (~3.8ms on a line-wrap character),
+        shortening whatever bit it lands on by ~9-28%, worst at 75 baud.
+2.20.0: ZAW_01: Two status LCD fixes. (1) CPU_INH_PIN now reflected on the
+        LCD continuously and immediately (edge-triggered via inhibitShown
+        in loop()), not just when it happens to block or interrupt a TX--
+        previously, asserting it while idle showed nothing until a TX was
+        attempted. (2) Line 2 no longer shows a literal "TX" during
+        transmission--setPTT() now only refreshes line 1 (lcdRefreshLine1())
+        at key-up, leaving whatever text the pre-TX preview wrote on line 2
+        visible for the rest of that transmission. Also renamed the
+        inhibited-state label from "INHIBITED" to "INHIBIT".
+2.19.0: ZAW_01: TX text preview on the status LCD now also catches text
+        that arrives in the same burst as TX_ON (the common case with
+        N1MM etc., which send '[' + message back-to-back)--drained and
+        previewed during setPTT()'s PA/PTT lead delay via the new
+        waitWithTxPreview(), still before this TX's first FSK bit is due.
+        Control characters (TX_ABORT/TX_END/COMMAND_ESCAPE/TX_ON) arriving
+        in that window are left untouched for loop() to handle as usual.
+2.18.0: ZAW_01: Boot splash PTT/PA timing screens now spell out "lead"/
+        "tail" instead of "L"/"T" (e.g. "PTT lead:200ms").
+2.17.0: ZAW_01: Removed the last serial output tied to an inhibited stop
+        (the "cmd:" line sent when CPU_INH_PIN force-stopped an in-progress
+        TX). Nothing is sent to the PC for an inhibited key-up attempt or
+        an inhibited mid-TX stop--only the LCD ("INHIBITED") reflects it.
+2.16.0: ZAW_01: Fixed a bug where changing baud rate or polarity via the
+        ~ config menu didn't refresh the status LCD--line 1's baud/polarity
+        field would show stale values until some unrelated update (PTT
+        transition, callsign change) happened to redraw it.
 2.15.0: ZAW_01: Status LCD line 1 TNC-sourced label changed from "TNC" to
         "FSK" (e.g. "FSK 45b H")--RTS-sourced label ("RTS DIGI") unchanged.
 2.14.0: ZAW_01: Status LCD line 2 text display moved from "live during TX"
@@ -90,7 +149,7 @@ Revisions:
 #include "LiquidCrystal_I2C.h"
 #include <string.h>
 
-#define FW_VERSION "2.15.0"
+#define FW_VERSION "2.25.0"
 #define VERSION FW_VERSION " - OK2ZAW mods."
 
 // OK2ZAW mod: external status LCD--16x2 character display on a PCF8574
@@ -138,6 +197,7 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 #define EE_PA_LEAD_ADDR 6      // int (2 bytes): ptt_PA_LeadMillis
 #define EE_PA_TAIL_ADDR 8      // int (2 bytes): ptt_PA_TailMillis
 #define EE_CALLSIGN_ADDR 10    // null-terminated string, up to CALLSIGN_MAX_LEN chars + NUL
+#define EE_LIVE_LCD_ADDR 17    // 1 byte: raw COMMAND_LIVE_LCD_ON/OFF char
 
 // Sane range for the millisecond timing values above--used to detect
 // blank/uninitialized EEPROM (which reads as -1) and reject garbage.
@@ -191,6 +251,8 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 #define COMMAND_SET_PA_LEAD  'l'  // PA/amp stage: time before main relay
 #define COMMAND_SET_PA_TAIL  't'  // PA/amp stage: time after main relay
 #define COMMAND_SET_CALLSIGN 'C'  // operator callsign
+#define COMMAND_LIVE_LCD_ON  'D'  // enable live TX text on the status LCD
+#define COMMAND_LIVE_LCD_OFF 'd'  // disable live TX text on the status LCD
 
 // Stop bit settings
 #define STOP_BITS_1     1    // 1 stop bit
@@ -240,8 +302,10 @@ void addToSendBuffer(byte newByte);
 byte getNextSendChar();
 boolean requiresLetters(byte asciiByte);
 boolean requiresFigures(byte asciiByte);
+void waitDrainingSerial(unsigned long ms);
 void setPTT(byte b);
 boolean isInhibited();
+void lcdRefreshLine1();
 void lcdShowStatus(const char* line2);
 void lcdShowSplash();
 void lcdResetTxLine();
@@ -425,6 +489,11 @@ int pttTailMillis = 25;  //time after last stop bit
 int ptt_PA_LeadMillis = 80; //time before first start bit
 int ptt_PA_TailMillis = 80;  //time after last stop bit
 
+// OK2ZAW mod: enables/disables the live TX-text write in getNextSendChar()
+// (see lcdAppendTxChar())--set/get via COMMAND_LIVE_LCD_ON/OFF ('D'/'d').
+// Default on, matching prior behavior; off skips that I2C write entirely.
+boolean liveLcdTextEnabled = true;
+
 
 // Polarity--changed with user commands and stored in EEPROM
 boolean mark = LOW;     //High indicates +V on the FSK pin
@@ -478,8 +547,14 @@ boolean callsignEntryHasChars = false;  // false if user pressed Enter with no c
 // line 1 without needing to know the current TX/RX state.
 const char* lcdLastLine2 = "RX";
 
-// OK2ZAW mod: current write column (0-15) on LCD line 2 for the live
-// pre-TX text preview--see lcdAppendTxChar(). Wraps back to 0 (and starts
+// OK2ZAW mod: true while the LCD is currently showing "INHIBIT"--tracks
+// isInhibited() edge-to-edge in loop(), so the display reflects the pin
+// continuously (including while idle), not just when it blocks/interrupts
+// a TX attempt.
+boolean inhibitShown = false;
+
+// OK2ZAW mod: current write column (0-15) on LCD line 2 for the live TX
+// text display--see lcdAppendTxChar(). Wraps back to 0 (and starts
 // overwriting from the left again) once it reaches LCD_COLS.
 byte lcdTxCol = 0;
 
@@ -497,14 +572,25 @@ Main execution
 */
 void setup()
 {
+  // OK2ZAW: assert the safe (unkeyed) state on both PTT outputs as the very
+  // first thing this sketch does--before Serial, EEPROM, the timer, or the
+  // LCD. This is the earliest point our code can control them; the pins
+  // are floating (not actively driven) for the brief window before this,
+  // while the bootloader itself is running, which is outside firmware's
+  // control since our code hasn't started yet. If that matters for your
+  // PTT circuit, add an external pull-down resistor on PTT_PIN/PTT_PA_PIN
+  // as a hardware-level guard for that window.
+  pinMode(PTT_PIN, OUTPUT);
+  pinMode(PTT_PA_PIN, OUTPUT);
+  digitalWrite(PTT_PIN, LOW);
+  digitalWrite(PTT_PA_PIN, LOW);
+
   Serial.begin(serialSpeed);
   while (!Serial) {
     ; // wait for serial port to connect. Needed for Leonardo only
   }
-  // configure pins for output
+  // configure remaining pins
   pinMode(FSK_PIN, OUTPUT);
-  pinMode(PTT_PIN, OUTPUT);
-  pinMode(PTT_PA_PIN, OUTPUT); // OK2ZAW
   pinMode(ON_PIN, OUTPUT); // OK2ZAW
   pinMode(PTT_USB_RTS_PIN, INPUT); // OK2ZAW: external pull-up already on the line
   pinMode(LED_RX_PIN, OUTPUT); // OK2ZAW
@@ -521,9 +607,12 @@ void setup()
 
   Serial.write("\ncmd:\n"); // Tell N1MM we are in "RX" mode.  This will be sent
                             // at the end of transmission.
-  digitalWrite(PTT_PIN, LOW);
   digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX indicator on--opposite of PTT_PIN
-  lcdShowStatus("RX"); // OK2ZAW
+  inhibitShown = isInhibited(); // OK2ZAW: correct initial LCD text if already inhibited at boot
+  lcdShowStatus(inhibitShown ? "INHIBIT" : "RX"); // OK2ZAW
+  // OK2ZAW: main status screen is now showing--this is the point [/RTS
+  // can first actually key up (loop(), where those are handled, can't run
+  // any earlier than this regardless--see the note at the top of setup()).
 }
 
 
@@ -537,26 +626,39 @@ void setup()
 void loop()
 {
 
-  // (0) OK2ZAW mod: hardware inhibit.  If it becomes asserted while we're
-  // transmitting, force an immediate stop--bypassing the configured PA/PTT
-  // tail delays entirely, since this is a safety cutoff, not a graceful
-  // end of transmission.  A blocked/attempted key-up is instead handled
-  // inside setPTT() itself (see isInhibited()).
-  if (isInhibited() && ptt)
+  // (0) OK2ZAW mod: hardware inhibit, edge-triggered against inhibitShown
+  // so the LCD reflects it continuously--including while idle--not just
+  // when it blocks/interrupts a TX attempt. If it becomes asserted while
+  // we're transmitting, also force an immediate stop--bypassing the
+  // configured PA/PTT tail delays entirely, since this is a safety
+  // cutoff, not a graceful end of transmission. A blocked key-up attempt
+  // is instead handled inside setPTT() itself (see isInhibited()).
+  // Deliberately silent on the serial port either way--no "cmd:" or any
+  // other line is sent for an inhibited stop, only the LCD reflects it.
+  boolean inhibitedNow = isInhibited();
+  if (inhibitedNow && !inhibitShown)
   {
-    digitalWrite(PTT_PA_PIN, LOW);
-    digitalWrite(PTT_PIN, LOW);
-    digitalWrite(LED_RX_PIN, HIGH);
-    digitalWrite(FSK_PIN, space);
-    ptt = false;
-    rtsKeyed = false;
-    resetSendBuffer();
-    endWhenBufferEmpty = true;
-    resetChar();
-    currentShiftState = SHIFT_UNKNOWN;
-    lastAsciiByteSent = 0;
-    Serial.write("\ncmd:\n"); // Tells N1MM that TX is finished
-    lcdShowStatus("INHIBITED"); // OK2ZAW
+    if (ptt)
+    {
+      digitalWrite(PTT_PA_PIN, LOW);
+      digitalWrite(PTT_PIN, LOW);
+      digitalWrite(LED_RX_PIN, HIGH);
+      digitalWrite(FSK_PIN, space);
+      ptt = false;
+      rtsKeyed = false;
+      resetSendBuffer();
+      endWhenBufferEmpty = true;
+      resetChar();
+      currentShiftState = SHIFT_UNKNOWN;
+      lastAsciiByteSent = 0;
+    }
+    lcdShowStatus("INHIBIT"); // OK2ZAW
+    inhibitShown = true;
+  }
+  else if (!inhibitedNow && inhibitShown)
+  {
+    inhibitShown = false;
+    if (!ptt) lcdShowStatus("RX"); // OK2ZAW: only if not (still) transmitting
   }
 
   // (1) OK2ZAW mod: poll the external hardware PTT-request input.  This lets
@@ -641,12 +743,10 @@ void loop()
       else  // character to TX, so add to send buffer
       {
         addToSendBuffer(b);
-        // OK2ZAW: preview queued text on the LCD before it's transmitted.
-        // Only while not already transmitting--once ptt is true this is
-        // skipped entirely, so it can never land inside the bit-timing
-        // path (contrast with the reverted in-TX version; see the note on
-        // getNextSendChar()).
-        if (!ptt) lcdAppendTxChar(b);
+        // OK2ZAW: deliberately no LCD write here--only getNextSendChar()
+        // shows text live, as each character is actually transmitted, so
+        // every new TX starts from a blank line 2. See lcdResetTxLine()
+        // and the note on getNextSendChar().
       }
     }
   }
@@ -723,11 +823,24 @@ void handleConfigurationCommand(byte b)
         startCallsignEntry();
         return;
       }
+      case (COMMAND_LIVE_LCD_ON):
+      {
+        liveLcdTextEnabled = true;
+        EEPROM.write(EE_LIVE_LCD_ADDR, b);
+        break;
+      }
+      case (COMMAND_LIVE_LCD_OFF):
+      {
+        liveLcdTextEnabled = false;
+        EEPROM.write(EE_LIVE_LCD_ADDR, b);
+        break;
+      }
       default :
       {
         Serial.write("\nNot a recognized command. Exiting configuration mode.\n");
       }
     }
+    lcdShowStatus(lcdLastLine2);  // OK2ZAW: refresh line 1 (baud/polarity affect the FSK/RTS field)
     displayConfiguration();
     configurationMode = false;
 }
@@ -957,6 +1070,11 @@ void eeLoad()
     i++;
   }
   callsign[i] = '\0';
+
+  // Live LCD text: default on unless explicitly turned off ('d'). A blank
+  // EEPROM byte (0xFF) is not COMMAND_LIVE_LCD_OFF, so this naturally
+  // defaults to enabled if never configured.
+  liveLcdTextEnabled = (EEPROM.read(EE_LIVE_LCD_ADDR) != COMMAND_LIVE_LCD_OFF);
 }
 
 /**
@@ -997,6 +1115,8 @@ void displayConfigurationPrompt()
   Serial.print(F("   l    Set/get PA lead time, ms (before PTT)\n"));
   Serial.print(F("   t    Set/get PA tail time, ms (after PTT)\n"));
   Serial.print(F("   C    Set/get callsign (max 6 chars)\n"));
+  Serial.print(F("   D    Enable live TX text on the status LCD\n"));
+  Serial.print(F("   d    Disable live TX text on the status LCD\n"));
   Serial.write("\n   ?    Show current configuration\n");
 }
 
@@ -1041,6 +1161,10 @@ void displayConfiguration()
 
   Serial.print(F("   Callsign:      "));
   Serial.write(callsign[0] != '\0' ? callsign : "(not set)");
+  Serial.write("\n");
+
+  Serial.print(F("   Live LCD text: "));
+  Serial.write(liveLcdTextEnabled ? "on" : "off");
   Serial.write("\n");
 }
 
@@ -1195,14 +1319,24 @@ void addToSendBuffer(byte newByte)
 * OK2ZAW note: this runs inside processHalfBit(), on the critical path
 * between one half-bit timer tick and the next FSK_PIN transition. Do NOT
 * add LCD/I2C calls (or anything else slow/blocking) here or anywhere else
-* called from processHalfBit()--it directly jitters TX bit timing (measured:
-* one lcd.print() of a single character is ~1.9ms of I2C traffic with
-* LiquidCrystal_I2C's 4-bit mode, ~3.8ms if a setCursor() is also needed--a
-* real, measured 9-28% shortening of whatever bit it lands on, worst at 75
-* baud). This was tried for a live TX-text display and reverted for exactly
-* that reason--see lcdAppendTxChar(), now called from the serial-receive
-* path in loop() instead, where it's genuinely free of this risk. Any LCD
-* update belongs in setPTT() or loop() outside this call chain, not here.
+* called from processHalfBit(), beyond the one already-accounted-for
+* exception below--it directly jitters TX bit timing (measured: one
+* lcd.print() of a single character is ~1.9ms of I2C traffic with
+* LiquidCrystal_I2C's 4-bit mode, ~3.8ms if a setCursor() is also
+* needed--a real, measured 9-28% shortening of whatever bit it lands on,
+* worst at 75 baud).
+*
+* The one deliberate exception is lcdAppendTxChar(), called below for
+* every character actually sent, to show live TX text on the LCD. This was
+* tried, measured, reverted for the cost above, tried again as
+* word-batched (worse: unbounded flush size), and finally restored here in
+* this simplest fixed-size form--a known, user-accepted tradeoff, not an
+* oversight. If you're tempted to batch multiple characters into one
+* flush to reduce write *frequency*, don't: it increases the per-flush
+* *duration* instead (proportional to however much text you batch), which
+* is a worse and less predictable bound than one character every time.
+* Any other new LCD update still belongs in setPTT() or loop() outside
+* this call chain, not here.
 */
 byte getNextSendChar()
 {
@@ -1244,6 +1378,7 @@ byte getNextSendChar()
         }
       }
       echo(asciiByte);
+      if (!rtsKeyed && liveLcdTextEnabled) lcdAppendTxChar(asciiByte);  // OK2ZAW: live per-character write, TNC-sourced only, user-toggleable--deliberate, measured tradeoff, see comment above
     }
   }
   else  // the buffer is empty
@@ -1294,6 +1429,39 @@ boolean requiresFigures(byte asciiByte)
 
 
 /**
+* OK2ZAW mod: waits for `ms` milliseconds like delay(), but also drains any
+* plain text bytes that arrive during the wait straight into the send
+* buffer (queued for transmission, not shown on the LCD--line 2 is
+* deliberately left alone until getNextSendChar() starts showing text
+* live, from the first character actually sent; see lcdResetTxLine()).
+* Only ever called from setPTT()'s PA/PTT lead delay, before the first FSK
+* bit of this TX is due--so unlike getNextSendChar(), there is no
+* bit-timing path here to interfere with.
+*
+* Control characters (TX_ABORT, TX_END, COMMAND_ESCAPE, TX_ON) are
+* deliberately left untouched in the serial buffer via Serial.peek()
+* rather than consumed here, so they still get handled by loop() exactly
+* as they always have, once this wait returns--this function only ever
+* takes plain data bytes off the buffer, never reinterprets a command.
+*/
+void waitDrainingSerial(unsigned long ms)
+{
+  unsigned long start = millis();
+  while (millis() - start < ms)
+  {
+    if (Serial.available() > 0)
+    {
+      byte peeked = Serial.peek();
+      if (peeked != TX_ABORT && peeked != TX_END && peeked != COMMAND_ESCAPE && peeked != TX_ON)
+      {
+        byte b = Serial.read();
+        addToSendBuffer(b);
+      }
+    }
+  }
+}
+
+/**
 * Turns the PTT on or off and applies any delays that might exist.
 */
 void setPTT(byte b)
@@ -1303,18 +1471,27 @@ void setPTT(byte b)
   {  // PTT ON
     if (isInhibited()) // OK2ZAW: refuse to key up while inhibited
     {
-      lcdShowStatus("INHIBITED"); // OK2ZAW
+      lcdShowStatus("INHIBIT"); // OK2ZAW
       return;
     }
     digitalWrite(PTT_PA_PIN, HIGH); // OK2ZAW mod PTT sequencer
-    delay(ptt_PA_LeadMillis);
+    waitDrainingSerial(ptt_PA_LeadMillis); // OK2ZAW: was delay()--see function comment
     digitalWrite(FSK_PIN, mark);  //always start in mark state
     digitalWrite(PTT_PIN, HIGH);
     digitalWrite(LED_RX_PIN, LOW); // OK2ZAW: RX LED off--opposite of PTT_PIN
-    lcdShowStatus("TX"); // OK2ZAW
+    // OK2ZAW: line 1 only--line 2 keeps showing "RX"/"INHIBIT" (whatever
+    // was last on it) through the lead delay; see lcdResetTxLine() below
+    // for where it actually goes blank, right before live text starts.
+    lcdRefreshLine1();
     // we will stay in the mark state for some amount of time
     // before sending the first start bit of the first character
-    delay(pttLeadMillis);
+    waitDrainingSerial(pttLeadMillis); // OK2ZAW: was delay()--see function comment
+    // OK2ZAW: blank line 2 right before real bit-banging starts, so the
+    // live text in getNextSendChar() always begins from column 1 on an
+    // empty line for every new TX--no leftover "RX"/"INHIBIT" text, and
+    // (since nothing is queued to the LCD during the lead delay anymore)
+    // nothing to double-show either.
+    lcdResetTxLine();
   }
   else
   {  // PTT OFF
@@ -1322,8 +1499,12 @@ void setPTT(byte b)
     delay (ptt_PA_TailMillis);
     digitalWrite(PTT_PIN, LOW); // drop PTT
     digitalWrite(LED_RX_PIN, HIGH); // OK2ZAW: RX LED on--opposite of PTT_PIN
-    lcdShowStatus("RX"); // OK2ZAW
-    lcdResetTxLine(); // OK2ZAW: back in RX--ready to preview the next queued text from column 1
+    // OK2ZAW: prefer INHIBIT over RX if the inhibit line is (already/still)
+    // asserted right as this TX ends normally--keeps inhibitShown in sync
+    // even in the rare case loop()'s own edge-check hasn't run yet.
+    inhibitShown = isInhibited();
+    lcdShowStatus(inhibitShown ? "INHIBIT" : "RX"); // OK2ZAW
+    lcdResetTxLine(); // OK2ZAW: back in RX--ready for the next TX's live text from column 1
     digitalWrite(FSK_PIN, space);
     delay (pttTailMillis);
     stopBitCounter = 0;
@@ -1369,22 +1550,22 @@ void lcdShowSplash()
 
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(F("PTT L:"));
+  lcd.print(F("PTT lead:"));
   lcd.print(pttLeadMillis);
   lcd.print(F("ms"));
   lcd.setCursor(0, 1);
-  lcd.print(F("PTT T:"));
+  lcd.print(F("PTT tail:"));
   lcd.print(pttTailMillis);
   lcd.print(F("ms"));
   delay(1500);
 
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print(F("PA  L:"));
+  lcd.print(F("PA lead:"));
   lcd.print(ptt_PA_LeadMillis);
   lcd.print(F("ms"));
   lcd.setCursor(0, 1);
-  lcd.print(F("PA  T:"));
+  lcd.print(F("PA tail:"));
   lcd.print(ptt_PA_TailMillis);
   lcd.print(F("ms"));
   delay(1500);
@@ -1402,9 +1583,9 @@ void lcdShowSplash()
 }
 
 /**
-* OK2ZAW mod: refreshes the status LCD. Line 1, columns 1-6, show the
-* configured callsign (or "CALL" if none is set); column 7 is a blank
-* separator. Columns 8-16 (9 columns) show the current PTT source:
+* OK2ZAW mod: refreshes LCD line 1 only. Columns 1-6 show the configured
+* callsign (or "CALL" if none is set); column 7 is a blank separator.
+* Columns 8-16 (9 columns) show the current PTT source:
 *   - TNC-sourced (this board's own serial/Baudot engine, the [ ] \
 *     commands): "FSK " + two-digit baud rate + "b " + polarity ("H" or
 *     "L"), e.g. "FSK 45b H"--fills all 9 columns exactly.
@@ -1412,14 +1593,12 @@ void lcdShowSplash()
 *     chars, column 16 left blank)--baud/polarity are this board's own
 *     internal FSK generator settings and don't apply to an external TNC,
 *     so "DIGI" (a generic digital-mode label) is shown instead.
-* Line 2 shows the current state (RX/TX/etc). Remembers the last line2
-* passed in, so other updates (e.g. a callsign change) can redraw line 1
-* without needing to know the current TX/RX state.
+* Used on its own (leaving line 2 untouched) when keying up, mid-lead-delay
+* in setPTT()--line 2 keeps showing "RX"/"INHIBIT" until lcdResetTxLine()
+* blanks it right before live TX text starts.
 */
-void lcdShowStatus(const char* line2)
+void lcdRefreshLine1()
 {
-  lcdLastLine2 = line2;
-
   const char* callsignField = (callsign[0] != '\0') ? callsign : "CALL";
 
   char line1[LCD_COLS + 1];
@@ -1450,6 +1629,18 @@ void lcdShowStatus(const char* line2)
 
   lcd.setCursor(0, 0);
   lcd.print(line1);
+}
+
+/**
+* OK2ZAW mod: refreshes both LCD lines--line 1 via lcdRefreshLine1(), plus
+* line 2 with the given status text (e.g. "RX" or "INHIBIT"). Remembers
+* the last line2 passed in, so other updates (e.g. a callsign change) can
+* redraw line 1 without needing to know the current RX/inhibit state.
+*/
+void lcdShowStatus(const char* line2)
+{
+  lcdLastLine2 = line2;
+  lcdRefreshLine1();
 
   lcd.setCursor(0, 1);
   lcd.print(line2);
@@ -1457,32 +1648,45 @@ void lcdShowStatus(const char* line2)
 }
 
 /**
-* OK2ZAW mod: resets the live TX-preview column (lcdTxCol) to the start of
-* line 2. Called when returning to RX, right after lcdShowStatus() has
-* already written "RX" there, so the next batch of queued text previews
-* from column 1. Just a variable write--no I2C--so it's harmless wherever
-* it's called from, including from inside setPTT() when that runs from the
-* processHalfBit() call chain (natural end of buffer).
+* OK2ZAW mod: clears line 2 and resets the live TX-text column (lcdTxCol)
+* to the start of it. Called in two places:
+*   1. Returning to RX, right after lcdShowStatus() has already written
+*      "RX"/"INHIBIT" there (so the blank-out here is redundant but
+*      harmless)--ready for the next TX's live text to start clean.
+*   2. setPTT(true), right before real bit-banging starts, to blank out
+*      whatever "RX"/"INHIBIT" was still showing, so getNextSendChar()'s
+*      live text always starts from an empty line 2 at column 1 for every
+*      new TX. At that point `ptt` is still false (it's set after this
+*      function's caller returns), so this is before
+*      processHalfBit() has anything to do--same safe-timing reasoning as
+*      the lead-delay waits themselves, just adding a small, one-time,
+*      fixed amount to the overall lead sequence (not a per-character/
+*      per-bit cost).
 */
 void lcdResetTxLine()
 {
   lcdTxCol = 0;
+  lcd.setCursor(0, 1);
+  for (byte i = 0; i < LCD_COLS; i++) lcd.print(' ');
 }
 
 /**
-* OK2ZAW mod: appends one character to LCD line 2 at the live TX-preview
+* OK2ZAW mod: appends one character to LCD line 2 at the live TX-text
 * cursor, wrapping back to column 1 (overwriting from the left again) once
 * the line is full. Non-printable bytes render as a blank.
 *
-* Called from loop(), in the serial-receive handler, only while !ptt (see
-* call site)--i.e. this previews text queued for an upcoming TX, before
-* it's actually transmitted. This is NOT called from getNextSendChar()/
-* processHalfBit() (that was tried and reverted--see the note on
-* getNextSendChar() for the measured cost). Because it only ever runs
-* while ptt is false, processHalfBit() is a no-op for the whole time this
-* function could possibly be called, so there is no bit-timing path for
-* it to interfere with--this is genuinely free of the earlier tradeoff,
-* not just a smaller version of it.
+* Called only from getNextSendChar(), for every character actually sent to
+* FSK_PIN (TNC-sourced only)--so line 2 shows exactly what's being
+* transmitted, live, and only that (no pre-TX preview; see
+* waitDrainingSerial() and lcdResetTxLine()). This IS inside the
+* bit-timing path, and is a deliberate, measured, user-accepted tradeoff:
+* ~1.9ms of I2C traffic per character (~3.8ms on a line-wrap character
+* needing a setCursor()), which shortens whatever bit it lands on by
+* roughly 9-28% (worst at 75 baud, worst on a wrap character). See the
+* note on getNextSendChar() before changing how/how-often this is called--
+* batching multiple characters into one flush makes the bound worse, not
+* better (duration scales with however much text you batch, unlike a
+* fixed one-character write).
 */
 void lcdAppendTxChar(byte b)
 {
